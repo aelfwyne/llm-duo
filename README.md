@@ -1,7 +1,7 @@
 # LLM Duo (Rust + Qt 6 / Kirigami)
 
 Run one **llama-server**, **KoboldCpp** or **vLLM** server per GPU from a two-pane
-KDE Plasma GUI. This is a Rust port of `llm_duo.py` (Python/Tk) with the same features:
+KDE Plasma GUI. 
 
 - one pane per GPU, each with its own backend (llama.cpp, KoboldCpp ROCm/Vulkan, vLLM — experimental)
 - per-(GPU, model) options saved automatically; live VRAM estimate while you change them; **Fit**
