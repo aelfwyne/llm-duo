@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LLM Duo
+GenericName=Local LLM server launcher
+Comment=Run one llama-server, KoboldCpp or vLLM server per GPU
+Exec=llm-duo
+Icon=io.github.llmduo
+Terminal=false
+Categories=Development;Utility;Qt;KDE;
+Keywords=llama;llm;gguf;vllm;koboldcpp;rocm;gpu;
+StartupWMClass=llm-duo

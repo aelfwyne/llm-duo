@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HF Model Finder</title>
+<style>
+:root{--bg:#f6f6f3;--panel:#fff;--text:#1c1c1f;--muted:#6c6c72;--border:#e3e3de;--accent:#e2830a;--accent-weak:#fff1dc;--chip:#eef0f3;--link:#1d5cc0;--bad:#c0392b;--ok:#1f8a4c}
+@media (prefers-color-scheme:dark){:root{--bg:#131315;--panel:#1c1c20;--text:#ececef;--muted:#9a9aa3;--border:#2d2d33;--accent:#ffa43a;--accent-weak:#3a2913;--chip:#2a2b31;--link:#7eaaff;--bad:#ff7b6c;--ok:#5fd393}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:24px 16px 60px}
+h1{font-size:22px;margin:0 0 2px}
+.sub{color:var(--muted);margin:0 0 18px}
+form.q{display:flex;gap:8px}
+form.q input{flex:1;font-size:16px;padding:11px 14px;border:1px solid var(--border);border-radius:10px;background:var(--panel);color:var(--text)}
+button{font:inherit;cursor:pointer;border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:10px;padding:8px 14px}
+button.primary{background:var(--accent);border-color:var(--accent);color:#1a1205;font-weight:600;padding:0 22px}
+.controls{display:flex;flex-wrap:wrap;gap:10px 14px;margin:14px 0 6px;padding:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px}
+.controls label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--muted)}
+.controls input,.controls select{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:5px 8px;min-width:0}
+.controls input[type=text],.controls input[type=password]{width:150px}
+.controls input[type=number]{width:110px}
+.controls label.chk{flex-direction:row;align-items:center;gap:6px;align-self:flex-end;padding-bottom:6px}
+.interp{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:10px 0;font-size:13px;color:var(--muted)}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--chip);color:var(--text);font-size:12px;white-space:nowrap}
+.tag b{color:var(--muted);font-weight:500;margin-right:4px}
+.tag.x{background:transparent;border:1px dashed var(--bad);color:var(--bad)}
+.status{font-size:13px;color:var(--muted);margin:6px 0 12px;min-height:18px}
+.status.err{color:var(--bad)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:8px}
+.top{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:baseline}
+.top a.name{font-weight:600;font-size:15px;color:var(--link);text-decoration:none;word-break:break-all}
+.top a.name span{color:var(--muted);font-weight:400}
+.top a:hover{text-decoration:underline}
+.badge{font-size:11px;padding:1px 7px;border-radius:5px;background:var(--accent-weak);color:var(--accent);font-weight:600;text-transform:uppercase}
+.badge.p{background:var(--chip);color:var(--muted);text-transform:none;font-weight:500}
+.meta{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:6px;color:var(--muted);font-size:12.5px}
+.meta a{color:var(--link);text-decoration:none}
+.quants{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.quants .tag{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
+.quants .tag.hit{background:var(--accent);color:#1a1205}
+.more{display:block;margin:14px auto}
+details{margin-top:4px;font-size:13px;color:var(--muted)}
+details code{background:var(--chip);padding:1px 5px;border-radius:4px}
+@media (max-width:600px){.controls input[type=text],.controls input[type=password]{width:120px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>HF Model Finder</h1>
+  <p class="sub">Type it the way you'd say it: <em>gemma 4 26b gguf</em>, <em>qwen3 coder 30b mlx 4bit</em>, <em>llama 3.1 8b q4_k_m by bartowski -abliterated</em></p>
+
+  <form class="q" id="qform">
+    <input id="q" type="text" placeholder="Show me Gemma 4 26B GGUF models only" autocomplete="off" autofocus>
+    <button class="primary" type="submit">Search</button>
+  </form>
+
+  <div class="controls">
+    <label>Format
+      <select id="format">
+        <option value="">Any</option>
+        <option>gguf</option><option>mlx</option><option>onnx</option><option>safetensors</option>
+        <option>awq</option><option>gptq</option><option>exl2</option><option>exl3</option>
+      </select>
+    </label>
+    <label>Quant (e.g. Q4_K_M, Q8, 4bit)<input id="quant" type="text"></label>
+    <label>Author / org<input id="author" type="text" placeholder="unsloth"></label>
+    <label>Exclude (comma sep.)<input id="exclude" type="text" placeholder="abliterated, uncensored"></label>
+    <label>Min downloads<input id="mindl" type="number" min="0" step="10" value="0"></label>
+    <label>Sort
+      <select id="sort">
+        <option value="downloads">Downloads</option>
+        <option value="likes">Likes</option>
+        <option value="lastModified">Recently updated</option>
+        <option value="createdAt">Newest</option>
+        <option value="id">Name</option>
+      </select>
+    </label>
+    <label>Fetch up to
+      <select id="maxn">
+        <option value="1000">1,000 / query</option>
+        <option value="3000" selected>3,000 / query</option>
+        <option value="10000">10,000 / query</option>
+      </select>
+    </label>
+    <label class="chk"><input id="loose" type="checkbox"> Loose name matching</label>
+    <label class="chk"><input id="officialOnly" type="checkbox"> Hide repos with 0 downloads</label>
+    <button type="button" id="resetFilters" style="align-self:flex-end;padding:5px 10px;font-size:12px" title="Clear all filters back to defaults">Reset filters</button>
+  </div>
+
+  <details>
+    <summary>Tips &amp; options</summary>
+    <p>Name words must all appear in the repo name. A number right after a word is treated as its version
+    (<code>gemma 4</code> matches <code>gemma-4</code>, <code>gemma4</code>, <code>Gemma_4</code> but not <code>gemma-3-4b</code>).
+    Sizes like <code>26b</code>, <code>1.5b</code>, <code>e4b</code>, <code>135m</code> match exactly, so <code>4b</code> won't match <code>a4b</code> or <code>14b</code>.
+    Exclude words with <code>-word</code> or <code>not word</code>. Set an author with <code>by name</code> or <code>name/model</code>.
+    Quant filters check the actual file names in the repo, so <code>q4_k_m</code> only shows repos that ship that file.</p>
+    <p>Loose matching lets name words match inside other words (e.g. <code>gemma</code> also hits <code>medgemma</code>).</p>
+    <label style="display:inline-flex;gap:6px;align-items:center">HF token (optional, for rate limits / gated repos)
+      <input id="token" type="password" style="width:220px;font:inherit;padding:4px 8px;border-radius:7px;border:1px solid var(--border);background:var(--bg);color:var(--text)">
+    </label>
+  </details>
+
+  <div class="interp" id="interp"></div>
+  <div class="status" id="status"></div>
+  <div id="results"></div>
+  <button class="more" id="more" hidden>Show more</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const API = 'https://huggingface.co/api/models';
+const STOP = new Set(('show me find get list all only models model the a an for with please search that are is in of give ' +
+  'i want looking need versions version quantized quantised quants quant files file repos repo any which what some like ' +
+  'just can you to on from hugging face huggingface hf').split(' '));
+const FORMATS = ['gguf','mlx','onnx','safetensors','awq','gptq','exl2','exl3'];
+const QUANT_TOKEN = /^(?:ud-)?(?:i?q\d(?:_[a-z0-9]+)*|tq\d_\d|bf16|fp16|f16|f32|fp8|mxfp4|nvfp4|\d+-?bits?)$/;
+const SIZE_TOKEN = /^e?\d+(?:\.\d+)?[bm]$/;
+const EXPAND = ['downloads','likes','lastModified','createdAt','tags','siblings','pipeline_tag','gated'];
+const PAGE = 60;
+
+let cache = { key: null, models: [] };
+let filtered = [], shown = 0, parsed = null, lastSearches = [];
+
+const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const html = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+/* ---------- query parsing ---------- */
+function parse(q) {
+  const out = { terms: [], size: '', format: '', quant: '', author: '', exclude: [] };
+  const raw = q.trim().split(/\s+/).filter(Boolean);
+  const toks = [];
+  for (let i = 0; i < raw.length; i++) {
+    let t = raw[i].toLowerCase().replace(/^[,;"'(]+|[,;"'?!)]+$/g, '');
+    if (!t) continue;
+    if (/^-[a-z0-9]/.test(t)) { out.exclude.push(t.slice(1)); continue; }
+    if (['not','without','no','except'].includes(t) && raw[i+1]) { out.exclude.push(raw[++i].toLowerCase().replace(/[,;]+$/,'')); continue; }
+    let m = t.match(/^(?:by|author|from|org):(.+)$/);
+    if (m) { out.author = m[1]; continue; }
+    if ((t === 'by' || t === 'from') && raw[i+1]) { out.author = raw[++i].toLowerCase().replace(/[^a-z0-9_.-]/g, ''); continue; }
+    if (t.includes('/')) { const [a, ...r] = t.split('/'); if (a) out.author = a; t = r.join('/'); if (!t) continue; }
+    if (QUANT_TOKEN.test(t) && !/^\d+$/.test(t)) { out.quant = t; continue; }
+    for (const p of t.split(/[-_]+/)) {
+      if (!p) continue;
+      const mm = p.match(/^([a-z]{2,})(\d+(?:\.\d+)?)$/);       // gemma4 -> gemma 4
+      if (mm && !SIZE_TOKEN.test(p) && !QUANT_TOKEN.test(p)) toks.push(mm[1], mm[2]);
+      else toks.push(p);
+    }
+  }
+  for (const t of toks) {
+    if (STOP.has(t)) continue;
+    if (FORMATS.includes(t)) { out.format = t; continue; }
+    if (QUANT_TOKEN.test(t) && !/^\d/.test(t)) { out.quant = t; continue; }
+    if (/^\d+-?bits?$/.test(t)) { out.quant = t; continue; }
+    if (SIZE_TOKEN.test(t)) { out.size = t; continue; }
+    if (/^\d+(?:\.\d+)?$/.test(t)) {
+      const last = out.terms[out.terms.length - 1];
+      if (last && !last.v && !/\d/.test(last.w)) last.v = t; else out.terms.push({ w: t });
+      continue;
+    }
+    out.terms.push({ w: t });
+  }
+  return out;
+}
+
+/* ---------- matchers ---------- */
+function termRe(t, loose) {
+  let p = (loose ? '' : '(?:^|[^a-z0-9])') + esc(t.w);
+  if (t.v) p += '[-_. ]?' + t.v.split('.').map(esc).join('[._-]?') + '(?!\\d)(?![bm](?![a-z]))';
+  return new RegExp(p, 'i');
+}
+function sizeRe(s) {
+  const m = s.match(/^(e?)(\d+(?:\.\d+)?)([bm])$/);
+  const num = m[2].split('.').map(esc).join('[._]');
+  const tail = m[2].includes('.') ? '' : '(?:[._]0)?';
+  return new RegExp('(?:^|[^a-z0-9.])' + (m[1] ? 'e' : 'e?') + num + tail + m[3] + '(?![a-z0-9])', 'i');
+}
+
+const QRE = /(?:^|[-_.])((?:UD-)?(?:IQ\d_[A-Z0-9]+(?:_[A-Z0-9]+)?|Q\d_K(?:_[A-Z]+)?|Q\d_\d|TQ\d_\d|MXFP4(?:_MOE)?|BF16|F16|F32))(?=[-_.]|$)/i;
+// GGUF files that aren't the model itself: multi-token-prediction heads, vision/audio projectors, speculative drafts, adapters
+const HELPER_RE = /(^|[-_.\/])(mtp|mmproj|projector|draft|eagle\d*|dflash|lora|adapter|imatrix|vocab)(?=[-_.\/]|$)/i;
+const HELPER_LABEL = w => { w = w.toLowerCase(); return w === 'mmproj' || w === 'projector' ? 'vision' : /^eagle|^dflash|^draft/.test(w) ? 'draft' : w === 'mtp' ? 'MTP' : w; };
+const QORDER =q => { const m = q.match(/(\d+)/); return (m ? +m[1] : 99) + (/^ud/i.test(q) ? .5 : 0); };
+
+function modelInfo(m) {
+  if (m._info) return m._info;
+  const files = (m.siblings || []).map(s => s.rfilename);
+  const quants = new Set(), helpers = new Set();
+  for (const f of files) {
+    if (!/\.gguf$/i.test(f)) continue;
+    const h = f.match(HELPER_RE);
+    if (h) { helpers.add(HELPER_LABEL(h[2])); continue; }       // MTP heads, vision projectors, drafts, adapters…
+    const base = f.split('/').pop().replace(/\.gguf$/i, '').replace(/-\d{5}-of-\d{5}$/i, '');
+    let mm = base.match(QRE);
+    // folder-style quants (e.g. Q4_K_M/model-00001-of-00002.gguf)
+    if (!mm && f.includes('/')) mm = ('-' + f.split('/')[0]).match(QRE);
+    if (mm) quants.add(mm[1].toUpperCase());
+  }
+  const id = m.id || m.modelId;
+  const name = id.split('/').pop();
+  const tags = (m.tags || []).map(t => t.toLowerCase());
+  const lname = id.toLowerCase();
+  const fmt = {
+    gguf: tags.includes('gguf') || /gguf/.test(lname) || files.some(f => /\.gguf$/i.test(f)),
+    mlx: tags.includes('mlx') || /(^|[-_/])mlx/.test(lname),
+    onnx: tags.includes('onnx') || files.some(f => /\.onnx$/i.test(f)),
+    safetensors: tags.includes('safetensors') || files.some(f => /\.safetensors$/i.test(f)),
+    awq: tags.includes('awq') || /awq/.test(lname),
+    gptq: tags.includes('gptq') || /gptq/.test(lname),
+    exl2: tags.includes('exl2') || /exl2/.test(lname),
+    exl3: tags.includes('exl3') || /exl3/.test(lname),
+  };
+  const bits = (lname.match(/(\d+)[-_]?bits?(?![a-z])/) || [])[1];
+  return m._info = { id, name, author: id.includes('/') ? id.split('/')[0] : '', quants: [...quants].sort((a,b)=>QORDER(a)-QORDER(b)||a.localeCompare(b)), helpers: [...helpers], fmt, bits, files };
+}
+
+function quantMatch(info, q) {
+  if (!q) return [true, null];
+  const bitm = q.match(/^(\d+)-?bits?$/);
+  if (bitm) {
+    if (info.bits === bitm[1]) return [true, null];
+    const hits = info.quants.filter(x => new RegExp('^(?:UD-)?I?Q' + bitm[1] + '_', 'i').test(x));
+    return [hits.length > 0, hits];
+  }
+  const Q = q.toUpperCase().replace(/^UD-/, '');
+  const hits = info.quants.filter(x => { const X = x.replace(/^UD-/, ''); return X === Q || X.startsWith(Q + '_') || (/^I?Q\d$/.test(Q) && X.startsWith(Q)); });
+  if (hits.length) return [true, hits];
+  if (Q === 'FP16' && info.quants.includes('F16')) return [true, ['F16']];
+  // non-GGUF repos often encode quant in the name (e.g. -fp8, -8bit)
+  if (new RegExp('(^|[-_.])' + esc(q) + '($|[-_.])', 'i').test(info.name)) return [true, null];
+  return [false, null];
+}
+
+/* ---------- fetching ---------- */
+function buildSearches(p, author) {
+  const first = p.terms[0];
+  if (!first) return author ? [''] : null;
+  if (!first.v) return [first.w];
+  const v = first.v, w = first.w;
+  const set = new Set([w + '-' + v, w + v, w + '_' + v, w + ' ' + v]);
+  if (v.includes('.')) { const vv = v.replace('.', '_'); set.add(w + '-' + vv); set.add(w + vv); }
+  return [...set];
+}
+
+async function fetchSearch(search, author, tag, maxN, onProgress) {
+  const token = $('token').value.trim();
+  const headers = token ? { Authorization: 'Bearer ' + token } : {};
+  const u = new URL(API);
+  if (search) u.searchParams.set('search', search);
+  if (author) u.searchParams.set('author', author);
+  if (tag) u.searchParams.set('filter', tag);
+  u.searchParams.set('sort', 'downloads');
+  u.searchParams.set('direction', '-1');
+  u.searchParams.set('limit', '1000');
+  EXPAND.forEach(e => u.searchParams.append('expand[]', e));
+  let url = u.toString(), all = [];
+  while (url && all.length < maxN) {
+    let res = await fetch(url, { headers });
+    if (res.status === 400 && url.includes('expand')) {          // fallback if expand is rejected
+      const f = new URL(url); f.searchParams.delete('expand[]'); f.searchParams.set('full', 'true');
+      url = f.toString(); res = await fetch(url, { headers });
+    }
+    if (res.status === 429) throw new Error('Rate limited by Hugging Face. Wait a minute or add a token under "Tips & options".');
+    if (!res.ok) throw new Error('HF API error ' + res.status + ' for "' + search + '"');
+    const data = await res.json();
+    all = all.concat(data);
+    onProgress(data.length);
+    const link = res.headers.get('Link') || '';
+    const m = link.match(/<([^>]+)>;\s*rel="next"/);
+    url = (m && data.length) ? m[1] : null;
+  }
+  return all;
+}
+
+/* ---------- main ---------- */
+function applyParsedToControls(p) {
+  if (p.format) $('format').value = p.format;
+  if (p.quant) $('quant').value = p.quant;
+  if (p.author) $('author').value = p.author;
+  if (p.exclude.length) {
+    const cur = $('exclude').value.split(',').map(s => s.trim()).filter(Boolean);
+    $('exclude').value = [...new Set([...cur, ...p.exclude])].join(', ');
+  }
+}
+
+function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = 'status' + (err ? ' err' : ''); }
+
+async function search(fromQuery) {
+  const q = $('q').value;
+  parsed = parse(q);
+  if (fromQuery) { applyParsedToControls(parsed); saveFilters(); }
+  try { location.hash = encodeURIComponent(q); } catch (e) {}
+  const author = $('author').value.trim().toLowerCase();
+  const format = $('format').value;
+  const tag = ['gguf','mlx','onnx'].includes(format) ? format : '';
+  const searches = buildSearches(parsed, author);
+  renderInterp();
+  if (!searches) { setStatus('Add a model name (e.g. "gemma 4") or an author to search.', true); $('results').innerHTML = ''; return; }
+  const maxN = +$('maxn').value;
+  const key = JSON.stringify([searches, author, tag, maxN]);
+  lastSearches = searches;
+  if (cache.key !== key) {
+    setStatus('Querying Hugging Face…');
+    $('results').innerHTML = '';
+    let got = 0;
+    try {
+      const lists = await Promise.all(searches.map(s => fetchSearch(s, author, tag, maxN, n => { got += n; setStatus('Fetched ' + got.toLocaleString() + ' candidate repos…'); })));
+      const seen = new Map();
+      lists.flat().forEach(m => { const id = m.id || m.modelId; if (!seen.has(id)) seen.set(id, m); });
+      cache = { key, models: [...seen.values()] };
+    } catch (e) {
+      const msg = e instanceof TypeError ? 'Network error reaching huggingface.co (offline, blocked, or CORS issue). ' + e.message : e.message;
+      setStatus(msg, true); return;
+    }
+  }
+  refilter();
+}
+
+function refilter() {
+  if (!parsed) return;
+  const loose = $('loose').checked;
+  const termRes = parsed.terms.map(t => termRe(t, loose));
+  const sRe = parsed.size ? sizeRe(parsed.size) : null;
+  const format = $('format').value;
+  const quant = $('quant').value.trim().toLowerCase();
+  const author = $('author').value.trim().toLowerCase();
+  const excl = $('exclude').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const minDl = +$('mindl').value || 0;
+  const hideZero = $('officialOnly').checked;
+
+  filtered = [];
+  for (const m of cache.models) {
+    const info = modelInfo(m);
+    const name = info.name.toLowerCase(), id = info.id.toLowerCase();
+    if (author && info.author.toLowerCase() !== author) continue;
+    if (!termRes.every(r => r.test(name))) continue;
+    if (sRe && !sRe.test(name)) continue;
+    if (format && !info.fmt[format]) continue;
+    if (excl.some(x => id.includes(x))) continue;
+    const dl = m.downloads || 0;
+    if (dl < minDl || (hideZero && dl === 0)) continue;
+    const [ok, hits] = quantMatch(info, quant);
+    if (!ok) continue;
+    m._hits = hits;
+    filtered.push(m);
+  }
+  const sort = $('sort').value;
+  filtered.sort((a, b) => {
+    if (sort === 'id') return modelInfo(a).id.localeCompare(modelInfo(b).id);
+    if (sort === 'lastModified' || sort === 'createdAt') return new Date(b[sort] || 0) - new Date(a[sort] || 0);
+    return (b[sort] || 0) - (a[sort] || 0);
+  });
+  setStatus(filtered.length.toLocaleString() + ' matching repos (from ' + cache.models.length.toLocaleString() + ' candidates)');
+  renderInterp();
+  shown = 0; $('results').innerHTML = ''; renderMore();
+}
+
+function ago(d) {
+  if (!d) return '';
+  const s = (Date.now() - new Date(d)) / 1000;
+  const u = [[31536000,'y'],[2592000,'mo'],[86400,'d'],[3600,'h'],[60,'m']];
+  for (const [n, l] of u) if (s >= n) return Math.floor(s / n) + l + ' ago';
+  return 'just now';
+}
+const num = n => n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n || 0);
+
+function renderMore() {
+  const frag = [];
+  for (const m of filtered.slice(shown, shown + PAGE)) {
+    const info = modelInfo(m);
+    const fmts = Object.entries(info.fmt).filter(([k, v]) => v && k !== 'safetensors').map(([k]) => '<span class="badge">' + k + '</span>').join('');
+    const hits = new Set(m._hits || []);
+    const qs = info.quants.length ? '<div class="quants">' + info.quants.map(q => '<span class="tag' + (hits.has(q) ? ' hit' : '') + '">' + html(q) + '</span>').join('') + '</div>' : '';
+    frag.push('<div class="card"><div class="top">' +
+      '<a class="name" href="https://huggingface.co/' + html(info.id) + '" target="_blank" rel="noopener"><span>' + html(info.author) + '/</span>' + html(info.name) + '</a>' +
+      fmts + (m.pipeline_tag ? '<span class="badge p">' + html(m.pipeline_tag) + '</span>' : '') +
+      (m.gated ? '<span class="badge p">gated</span>' : '') +
+      info.helpers.map(h => '<span class="badge p" title="Extra helper file in this repo, not a model quant">+' + html(h) + '</span>').join('') +
+      '</div>' + qs +
+      '<div class="meta"><span>↓ ' + num(m.downloads) + '</span><span>♥ ' + num(m.likes) + '</span>' +
+      (m.lastModified ? '<span>updated ' + ago(m.lastModified) + '</span>' : '') +
+      '<a href="https://huggingface.co/' + html(info.id) + '/tree/main" target="_blank" rel="noopener">files</a></div></div>');
+  }
+  $('results').insertAdjacentHTML('beforeend', frag.join(''));
+  shown += PAGE;
+  $('more').hidden = shown >= filtered.length;
+  if (!filtered.length && cache.models.length) $('results').innerHTML = '<p style="color:var(--muted)">No repos matched. Try loosening a filter, enabling loose matching, or raising "Fetch up to".</p>';
+}
+
+function renderInterp() {
+  if (!parsed) return;
+  const t = [];
+  parsed.terms.forEach(x => t.push('<span class="tag"><b>name</b>' + html(x.w + (x.v ? ' ' + x.v : '')) + '</span>'));
+  if (parsed.size) t.push('<span class="tag"><b>size</b>' + html(parsed.size.toUpperCase()) + '</span>');
+  if ($('format').value) t.push('<span class="tag"><b>format</b>' + html($('format').value) + '</span>');
+  if ($('quant').value.trim()) t.push('<span class="tag"><b>quant</b>' + html($('quant').value.trim()) + '</span>');
+  if ($('author').value.trim()) t.push('<span class="tag"><b>by</b>' + html($('author').value.trim()) + '</span>');
+  $('exclude').value.split(',').map(s => s.trim()).filter(Boolean).forEach(x => t.push('<span class="tag x">−' + html(x) + '</span>'));
+  $('interp').innerHTML = t.length ? 'Interpreted as: ' + t.join('') : '';
+}
+
+/* ---------- saved filters ---------- */
+const SAVED = ['format','quant','author','exclude','mindl','sort','maxn','loose','officialOnly'];
+const DEFAULTS = {};
+SAVED.forEach(id => { const el = $(id); DEFAULTS[id] = el.type === 'checkbox' ? el.checked : el.value; });
+function saveFilters() {
+  const o = {};
+  SAVED.forEach(id => { const el = $(id); o[id] = el.type === 'checkbox' ? el.checked : el.value; });
+  try { localStorage.setItem('hfFinderFilters', JSON.stringify(o)); } catch (e) {}
+}
+function loadFilters() {
+  let o = null;
+  try { o = JSON.parse(localStorage.getItem('hfFinderFilters') || 'null'); } catch (e) {}
+  if (!o) return;
+  SAVED.forEach(id => { if (id in o) { const el = $(id); if (el.type === 'checkbox') el.checked = !!o[id]; else el.value = o[id]; } });
+}
+loadFilters();
+SAVED.forEach(id => { $(id).addEventListener('input', saveFilters); $(id).addEventListener('change', saveFilters); });
+$('resetFilters').addEventListener('click', () => {
+  SAVED.forEach(id => { const el = $(id); if (el.type === 'checkbox') el.checked = DEFAULTS[id]; else el.value = DEFAULTS[id]; });
+  saveFilters();
+  if (parsed) search(false);
+});
+
+/* ---------- wiring ---------- */
+$('qform').addEventListener('submit', e => { e.preventDefault(); search(true); });
+['format','author','maxn'].forEach(id => $(id).addEventListener('change', () => parsed && search(false)));
+['quant','exclude','mindl'].forEach(id => $(id).addEventListener('input', () => cache.key && refilter()));
+['sort','loose','officialOnly'].forEach(id => $(id).addEventListener('change', () => cache.key && refilter()));
+$('more').addEventListener('click', renderMore);
+$('token').addEventListener('change', () => { try { localStorage.setItem('hfToken', $('token').value); } catch (e) {} });
+try { $('token').value = localStorage.getItem('hfToken') || ''; } catch (e) {}
+
+if (location.hash.length > 1) {
+  try { $('q').value = decodeURIComponent(location.hash.slice(1)); search(true); } catch (e) {}
+}
+</script>
+</body>
+</html>
