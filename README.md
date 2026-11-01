@@ -1,9 +1,9 @@
 # LLM Duo (Rust + Qt 6 / Kirigami)
 
-Run one **llama-server**, **KoboldCpp** or **vLLM** server per GPU from a two-pane
-KDE Plasma GUI. 
+Run one **llama-server**, **KoboldCpp**, **vLLM** or **Radiance** server per GPU from a two-pane
+KDE Plasma GUI.
 
-- one pane per GPU, each with its own backend (llama.cpp, KoboldCpp ROCm/Vulkan, vLLM — experimental)
+- one pane per GPU, each with its own backend (llama.cpp, KoboldCpp ROCm/Vulkan, Radiance, vLLM — experimental)
 - per-(GPU, model) options saved automatically; live VRAM estimate while you change them; **Fit**
 - Dual GPU mode (one model across both cards: layer/row/tensor split for llama.cpp/KoboldCpp,
   pipeline/tensor parallel for vLLM)

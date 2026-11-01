@@ -3,7 +3,7 @@ name = "llm-duo"
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Run one llama-server, KoboldCpp or vLLM server per GPU from a two-pane KDE Plasma (Qt 6 / Kirigami) GUI"
+description = "Run one llama-server, KoboldCpp, vLLM or Radiance server per GPU from a two-pane KDE Plasma (Qt 6 / Kirigami) GUI"
 license = "MIT"
 publish = false
 
