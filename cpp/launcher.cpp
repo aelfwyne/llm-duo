@@ -35,7 +35,7 @@ extern "C" int llmduo_run_gui(int argc, char **argv)
     QApplication app(s_argc, argv);
     QApplication::setApplicationName(QStringLiteral("llm-duo"));
     QApplication::setApplicationDisplayName(QStringLiteral("LLM Duo"));
-    QApplication::setApplicationVersion(QStringLiteral("2.0.0"));
+    QApplication::setApplicationVersion(QStringLiteral("1.0.0"));
     QApplication::setDesktopFileName(QStringLiteral("io.github.llmduo"));
     QApplication::setWindowIcon(QIcon::fromTheme(QStringLiteral("io.github.llmduo"),
                                                  QIcon::fromTheme(QStringLiteral("cpu"))));

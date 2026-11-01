@@ -13,9 +13,6 @@ KDE Plasma GUI.
 - FP8 quantize tool for vLLM models
 - **Dashboard** (live performance) and **History** (every configuration) windows - see below
 
-Settings files written by the Python version are read as they are (see *Moving over from the
-Python version* below).
-
 ![LLM Duo running llama.cpp on one card and vLLM on the other](docs/screenshot.png)
 
 *(Captured headless against stand-in servers, so it shows Qt's Fusion style; on Plasma it uses Breeze.)*
@@ -92,20 +89,14 @@ scripts/install-local.sh --uninstall
 
 After installing, LLM Duo appears in the application launcher (Development / Utilities).
 
-## Moving over from the Python version
+## Where settings and data live
 
 Settings live in `~/.config/llm-duo/llm_duo_settings.json`; logs, relaxed templates, the
-quantizer script and the chime sound in `~/.local/share/llm-duo/`. To keep your saved options,
-calibrations and stats:
+quantizer script and the chime sound in `~/.local/share/llm-duo/`.
 
-```bash
-mkdir -p ~/.config/llm-duo
-cp /path/to/old/llm_duo_settings.json ~/.config/llm-duo/
-```
-
-Alternatively set `LLM_DUO_DIR=/path/to/old/folder` to keep everything (settings, `logs/`,
-`templates/`, `tools/`) in one folder like the Python app did, or put the binary next to an
-existing `llm_duo_settings.json` (portable mode).
+To keep everything (settings, `logs/`, `templates/`, `tools/`) in one folder instead, set
+`LLM_DUO_DIR=/path/to/folder`, or put the binary next to an existing `llm_duo_settings.json`
+(portable mode).
 
 ## Performance dashboards
 
@@ -129,10 +120,9 @@ display). Request figures come from llama.cpp for now; for KoboldCpp and vLLM on
 cancelled loads, requests, aborted requests, crashes, RAM spills, speeds and draft / cache figures,
 charts the fastest setups, and shows the request-by-request trend of the one you click.
 
-The totals come from the `stats` section of the settings file (also written by the Python version).
-From this version on, LLM Duo also appends every load, request, abort and crash to
-`~/.local/share/llm-duo/history.jsonl`, and keeps the totals of a configuration there when its load
-options change (the settings file starts those totals over).
+The totals come from the `stats` section of the settings file. LLM Duo also appends every load,
+request, abort and crash to `~/.local/share/llm-duo/history.jsonl`, and keeps the totals of a
+configuration there when its load options change (the settings file starts those totals over).
 
 ![History (with real-world settings, test machine)](docs/history.png)
 
@@ -207,16 +197,6 @@ are listed too. Naming `--arch` in Extra args turns the clef additions off.
 The log parsing is written from Radiance's documentation, not a live log. If a status line stays
 empty or Fit says it couldn't read the pool, send the startup log and the parser can be adjusted.
 
-## Differences from the Tk version
-
-- Dialogs never block the window: questions (e.g. Fit's "move MoE experts to RAM?") are answered
-  in a dialog and applied afterwards; error reports still never pop up on their own — the
-  **View error** button and the window title flag them, as before.
-- Server output is read through one pipe for stdout + stderr (KoboldCpp still through a
-  pseudo-terminal, so its live progress lines work).
-- Colours follow the Plasma colour scheme (positive / neutral / negative text colours) instead of
-  fixed hex colours, so the estimate stays readable in dark themes.
-
 ## Troubleshooting
 
 | Problem | Fix |
@@ -238,7 +218,9 @@ cargo test     # needs the Qt dev packages too, since the crate links Qt
 
 ## Changelog
 
-### Unreleased
+### 1.0.0
+
+First release.
 
 Added:
 
