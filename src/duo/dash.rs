@@ -108,7 +108,7 @@ fn stats_row(key: &str, rel: &str, st: &Opts, status: &str) -> Value {
     let mut setup = Map::new();
     for k in ["ctx", "kv", "kv_dtype", "ngl", "n_cpu_moe", "batch", "ubatch", "parallel", "threads", "fa", "mtp", "mtp_n",
               "dual_strategy", "dual_mode", "extra", "gpu_util", "dtype", "max_batched", "cpu_offload",
-              "r_kv", "r_batched", "r_spec", "r_draft_window", "r_vision", "r_placement", "r_host_pool", "r_tp_wire"] {
+              "r_kv", "r_batched", "r_spec", "r_spec_ngram", "r_draft_window", "r_vision", "r_placement", "r_host_pool", "r_tp_wire"] {
         if (k.starts_with("dual_") || k == "r_tp_wire") && !dual {
             continue; // stored for every setup, only meaningful in Dual GPU mode
         }

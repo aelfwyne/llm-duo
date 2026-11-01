@@ -27,8 +27,12 @@ pub const RAD_STRATEGIES: [&str; 1] = ["Tensor parallel"];
 
 /// Options that change how Radiance splits the card. A recorded KV pool is only reused for the
 /// same values (context is not one: the pool is the same at any `--max-model-len` it can hold).
-pub const RAD_POOL_KEYS: [&str; 10] =
-    ["r_kv", "parallel", "r_batched", "r_headroom", "r_vision", "r_embed", "r_placement", "r_host_pool", "r_spec", "r_prefill_span"];
+pub const RAD_POOL_KEYS: [&str; 11] = [
+    "r_kv", "parallel", "r_batched", "r_headroom", "r_vision", "r_embed", "r_placement", "r_host_pool", "r_spec", "r_spec_ngram", "r_prefill_span",
+];
+
+/// The environment variable the API key travels in when the build takes `--api-key-env`.
+pub const RAD_KEY_ENV: &str = "RADIANCE_API_KEY";
 
 // ------------------------------------------------------------------ tools --
 /// Where the rad-* tools live, set from the settings (Info::load has no access to them).
@@ -41,6 +45,25 @@ pub fn set_tools(radiance_bin: &str, home: &str) {
 
 fn tools() -> (String, String) {
     TOOLS.get().map(|m| m.lock().unwrap().clone()).unwrap_or_default()
+}
+
+/// Does this radiance binary list `flag` in its --help? Remembered per binary and modification
+/// time (an update replaces the file). An unknown option stops the server, so a binary that can't
+/// be asked counts as not having it.
+pub fn binary_has_flag(bin: &Path, flag: &str) -> bool {
+    type Key = (PathBuf, Option<std::time::SystemTime>);
+    static HELP: OnceLock<Mutex<HashMap<Key, String>>> = OnceLock::new();
+    let key = (bin.to_path_buf(), std::fs::metadata(bin).and_then(|m| m.modified()).ok());
+    let mut m = HELP.get_or_init(Default::default).lock().unwrap();
+    let help = m.entry(key).or_insert_with(|| {
+        let cmd = [bin.to_string_lossy().into_owned(), "--help".to_string()];
+        run_capture(&cmd, &[], Duration::from_secs(5)).map(|x| x.1).unwrap_or_default()
+    });
+    help_has_flag(help, flag)
+}
+
+fn help_has_flag(help: &str, flag: &str) -> bool {
+    help.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).any(|w| w == flag)
 }
 
 /// A tool next to the radiance binary (`rad-info`, `rad-convert`), else from PATH.
@@ -138,6 +161,28 @@ pub fn scan_rad_models(root: &str) -> Vec<String> {
     out
 }
 
+/// What a model serves, where that isn't plain text generation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RadKind {
+    #[default]
+    Generate,
+    Embedding,
+    Rerank,
+    /// d1, clef, clef-flash, Mica, Laya: `decision.type` in the container
+    Decision,
+}
+
+const RERANK_ARCH: &str = "Mistral3ForSequenceClassification";
+
+fn kind_of_arch(arch: &str) -> RadKind {
+    match arch {
+        "nemotron35_embed" | "embgemma2" | "nomicbert" | "Mistral3Model" => RadKind::Embedding,
+        RERANK_ARCH => RadKind::Rerank,
+        "clef" | "laya" => RadKind::Decision,
+        _ => RadKind::Generate,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RadInfo {
     pub path: PathBuf,
@@ -155,6 +200,9 @@ pub struct RadInfo {
     pub n_layer: usize,
     pub vision: bool,
     pub draft: bool,
+    pub kind: RadKind,
+    /// `decision.type` of a decision model
+    pub decision: String,
     /// rad-info missing / failed: what went wrong (the model can still be served)
     pub note: String,
 }
@@ -203,6 +251,7 @@ impl RadInfo {
                     r.source_quant = v.quant.clone();
                     r.meta_text = v.metadata_text();
                     r.format = "checkpoint folder (served at its own precision)".into();
+                    r.kind = kind_of_arch(&r.arch);
                 }
                 Err(e) => r.note = format!("config.json: {e}"),
             }
@@ -291,6 +340,12 @@ impl RadInfo {
             if self.arch.is_empty() && (kl == "architecture" || kl.ends_with("general.architecture")) {
                 self.arch = last.clone();
             }
+            if kl == "decision.type" {
+                self.decision = last.clone();
+            }
+            if kl == "architectures" && v.contains(RERANK_ARCH) {
+                self.kind = RadKind::Rerank;
+            }
             self.meta.push((k, v));
         }
         let low = self.summary_text.to_lowercase();
@@ -299,6 +354,11 @@ impl RadInfo {
         }
         if low.contains("draft.") || low.contains("draft head") {
             self.draft = true;
+        }
+        if !self.decision.is_empty() {
+            self.kind = RadKind::Decision;
+        } else if self.kind == RadKind::Generate {
+            self.kind = kind_of_arch(&self.arch);
         }
     }
 
@@ -332,6 +392,13 @@ impl RadInfo {
         }
         if self.is_dir {
             parts.push("checkpoint folder".into());
+        }
+        match self.kind {
+            RadKind::Generate => {}
+            RadKind::Embedding => parts.push("embedding model: /v1/embeddings".into()),
+            RadKind::Rerank => parts.push("rerank model: /rerank, /v1/rerank".into()),
+            RadKind::Decision if self.decision.is_empty() => parts.push("decision model: /v1/systemone".into()),
+            RadKind::Decision => parts.push(format!("decision model ({}): /v1/systemone", self.decision)),
         }
         let mut s = parts.join("  •  ");
         if !self.note.is_empty() {
@@ -409,6 +476,9 @@ pub fn kv_tokens_of(line: &str) -> Option<i64> {
     let low = line.to_lowercase();
     if re.err.is_match(line) || low.contains("did not fit") || low.contains("refused") || low.contains("short by") {
         return None; // an error naming a size is not the pool
+    }
+    if low.contains("kv tiers:") {
+        return None; // the prefix cache's host tier, not the pool
     }
     if !(low.contains("tokens of context") || low.contains("kv cache") || low.contains("kv pool")) {
         return None;
@@ -536,6 +606,22 @@ pub fn parse_rad_metrics(text: &str) -> HashMap<String, f64> {
 pub fn rad_failure_hint(lines: &[String]) -> String {
     let text = lines.join("\n");
     let m = |p: &str| Regex::new(p).unwrap().is_match(&text);
+    // the last E line of this refusal only says the fix was named above, so quote the one above
+    if let Some(c) = Regex::new(r"incompatible configuration: (.+)").unwrap().captures(&text) {
+        return format!(
+            "Radiance refuses to serve on this machine's configuration:\n{}\n\nFix that. --proceed-with-incompatible-configuration in Extra args starts it anyway, unsupported.",
+            c[1].trim()
+        );
+    }
+    if m(r"--spec-ngram drafts by prompt lookup alone") {
+        return "This container has its own draft head, so Prompt lookup can't take over.\nSet Prompt lookup to 0 and use Spec tokens: lookup then fills in wherever the head declines.".into();
+    }
+    if m(r"--spec-ngram \d+ sets the speculative window") {
+        return "--spec-ngram and --num-speculative-tokens disagree.\nUse the Prompt lookup field, or remove one of them from Extra args.".into();
+    }
+    if m(r"--api-key-env: \S+ is unset or empty") {
+        return "The variable named by --api-key-env is unset or empty.\nSet it in Settings (Radiance environment) or put the key in Settings instead.".into();
+    }
     if m(r"resolve only to a reference implementation|libref") {
         return "Some ops have no kernel for this card (only the reference implementation).\nCheck Radiance home in Settings (it must hold kernels/, architectures/ and quantizers/), or rebuild Radiance for this GPU.".into();
     }
@@ -576,7 +662,13 @@ pub fn rad_failure_hint(lines: &[String]) -> String {
     if m(r"(?i)no such file|cannot open|failed to open") && m(r"(?i)radiance_home|architectures|kernels") {
         return "Radiance could not find its plugins. Set Radiance home in Settings (e.g. ~/radiance/build/radiance_home).".into();
     }
-    if let Some(c) = Regex::new(r"(?m)^\s*(?:\[[^\]]*\]\s*)?E\s+(.{8,})$").unwrap().captures_iter(&text).last() {
+    // a plugin states why on a line of its own; the E lines after it only point back up
+    if let Some(c) = Regex::new(r"(?m)^radiance: (.{8,})$").unwrap().captures_iter(&text).last() {
+        return format!("Radiance reported: {}", c[1].trim());
+    }
+    let pointer = Regex::new(r"^startup stopped:|rad_arch_declare returned").unwrap();
+    let e_lines = Regex::new(r"(?m)^\s*(?:\[[^\]]*\]\s*)?E\s+(.{8,})$").unwrap();
+    if let Some(c) = e_lines.captures_iter(&text).filter(|c| !pointer.is_match(c[1].trim())).last() {
         return format!("Radiance reported: {}", c[1].trim());
     }
     String::new()
@@ -721,6 +813,64 @@ impl RecipeKind {
     }
 }
 
+/// Recipes that name data files relative to the Radiance repository (`vq=data/codebooks/…`).
+pub fn recipe_needs_repo_cwd(text: &str) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let re = R.get_or_init(|| Regex::new(r"(?m)^\s*[^#\s].*\b(?:vq|tcq|table)=data/").unwrap());
+    re.is_match(text)
+}
+
+/// A recipe rule reads `$CALIB` (GPTQ's calibration Hessians).
+pub fn recipe_needs_calib(text: &str) -> bool {
+    text.lines().any(|l| !l.trim_start().starts_with('#') && l.contains("$CALIB"))
+}
+
+/// The repository a recipes folder belongs to: `<repo>/data/recipes`, with the codebooks beside it.
+pub fn repo_of_recipe(recipe: &Path) -> Option<PathBuf> {
+    let data = recipe.parent()?.parent()?;
+    data.join("codebooks").is_dir().then(|| data.parent().map(Path::to_path_buf)).flatten()
+}
+
+/// The decision format of a checkpoint folder that needs telling at convert time.
+pub fn decision_kind(dir: &Path) -> Option<&'static str> {
+    if dir.join("joint_head_config.json").is_file() {
+        return Some("clef");
+    }
+    if is_laya_dir(dir) {
+        return Some("laya");
+    }
+    None
+}
+
+/// A Laya release keeps its parts in folders and may have no config.json of its own.
+pub fn is_laya_dir(dir: &Path) -> bool {
+    dir.join("rl_agent_config.json").is_file() && dir.join("encoder/config.json").is_file()
+}
+
+/// Laya checkpoint folders under `root`.
+pub fn scan_laya(root: &str) -> Vec<PathBuf> {
+    fn walk(d: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+        if depth > 8 {
+            return;
+        }
+        if is_laya_dir(d) {
+            out.push(d.to_path_buf());
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.filter_map(|e| e.ok()) {
+            let hidden = e.file_name().to_string_lossy().starts_with('.');
+            if !hidden && e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                walk(&e.path(), out, depth + 1);
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(Path::new(root), &mut out, 0);
+    out.sort();
+    out
+}
+
 /// What a checkpoint folder is: its family and whether it is already quantised.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CkptKind {
@@ -861,6 +1011,8 @@ mod tests {
         assert_eq!(kv_tokens_of("I prefill chunks of at most 2048 tokens"), None);
         assert_eq!(kv_tokens_of("I the cache holds 117,000 tokens of context"), Some(117000));
         assert_eq!(kv_tokens_of("E KV group 'kv_attn': 1 x 262144 tokens did not fit the KV pool (DID NOT FIT)"), None);
+        assert_eq!(kv_tokens_of("W kv tiers: --prefix-cache-mib 512 holds 9000 tokens of context (1 MiB per 256-token block), less than one"), None);
+        assert_eq!(kv_tokens_of("I kv tiers: a finished conversation's KV is copied to host memory at once (2.00 GiB, 8 entries, 64000 tokens of context) and"), None);
         let b = rre().backs.captures("I kv: the pool backs 87% of the worst case (2 x 131072 tokens): 1.7 full-length sessions").unwrap();
         assert_eq!(&b[1], "87");
         assert_eq!(&b[2], "1.7");
@@ -927,6 +1079,123 @@ mod tests {
     fn hint() {
         let l = vec!["I x".to_string(), "E unknown option '--foo'".to_string()];
         assert!(rad_failure_hint(&l).contains("--foo"));
+        let cwsr = vec![
+            "E incompatible configuration: cwsr-off: amdgpu cwsr_enable is 0 -- the card hangs. Fix: amdgpu.cwsr_enable=1 as a module option".to_string(),
+            "E radiance does not start on a configuration it does not support: the fix for each is said above.".to_string(),
+        ];
+        assert!(rad_failure_hint(&cwsr).contains("amdgpu.cwsr_enable=1"));
+        let started = vec!["W incompatible configuration, started anyway: cwsr-off: x. Fix: y".to_string()];
+        assert_eq!(rad_failure_hint(&started), "");
+        let head = vec!["E --spec-ngram drafts by prompt lookup alone, and this container declares the draft head 'dflash'; serve it".to_string()];
+        assert!(rad_failure_hint(&head).contains("Prompt lookup"));
+        let window = vec!["E --spec-ngram 5 sets the speculative window to 5, and --num-speculative-tokens asks for 4; give one".to_string()];
+        assert!(rad_failure_hint(&window).contains("disagree"));
+        let env = vec!["E --api-key-env: RADIANCE_API_KEY is unset or empty; refusing to serve keyless".to_string()];
+        assert!(rad_failure_hint(&env).contains("--api-key-env"));
+        // from a live 1.15.0 start: a block head's window, refused inside the plugin
+        let block = vec![
+            "radiance: DFlash2's convolution masks the block position with block_size - 1, so the query block has to be a power of two. This serve asks for 5 draft tokens, which makes it 6; the checkpoint was trained at 8 (7 draft tokens).".to_string(),
+            "E qwen35_fp8: rad_arch_declare returned unsupported".to_string(),
+            "I STARTUP REPORT -- radiance 1.15.0 -- STARTUP STOPPED; this is what it had resolved when it did".to_string(),
+            "E startup stopped: unsupported (the reason is said above the startup report)".to_string(),
+        ];
+        assert!(rad_failure_hint(&block).contains("7 draft tokens"));
+        assert_eq!(rad_failure_hint(&block[1..]), "", "nothing but pointers: no reason to show");
+    }
+
+    #[test]
+    fn live_log() {
+        // from a live 1.15.0 start of a Gemma 4 container at context 16384
+        let log = [
+            "I activation arena: not lent -- the 'gemma4_bf16' plugin does not declare at a smaller step size (RadArchProbe::shape_probe_ok)",
+            "I kv: the pool backs 100% of the worst case (1 sequences all at 16384 tokens), 1.0 full-length sessions; a larger --host-pool-mib gives the cache more",
+            "  elastic             10.53 GiB   the experts keep what the host pool cannot hold; the cache takes the rest",
+            "    kv cache           1.81 GiB   17% of it -- backs 1 sequences all at 16384 tokens at once, which is the worst case and",
+            "    unusable           8.73 GiB   neither side could take it: both are at their ceiling",
+            "I kv tiers: off (no --prefix-cache-mib); a finished conversation's KV stays in VRAM until the cache evicts it",
+            "I kv: the cache can grow to 1.81 GiB a card -- 16384 tokens of context, 1.0 sessions at 16384 -- with every block it lends the experts taken back; 0 B of that is per-sequence state, and nothing is lent: it is all the cache's",
+        ];
+        let mut b = Budget::default();
+        for l in log {
+            b.line(l);
+        }
+        assert_eq!(b.kv_tokens, Some(16384));
+        let cap = b.capacity().unwrap();
+        assert!(cap > 90_000 && cap < 100_000, "{cap}");
+        assert!(rre().arena.captures(log[0]).is_none());
+        let c = rre().backs.captures(log[1]).unwrap();
+        assert_eq!((&c[1], &c[2]), ("100", "1.0"));
+        let s = rre().settled.captures("I card 0 settled at 8.87 GiB free against 141.43 MiB (the 96.00 MiB --gpu-headroom-mib and").unwrap();
+        assert_eq!((&s[1], &s[2], &s[3]), ("0", "8.87", "GiB"));
+        assert!(rre().serving.is_match("I serving on http://127.0.0.1:18937  (/v1/completions; /v1/chat/completions with tools and reasoning; a bearer key is required)"));
+    }
+
+    #[test]
+    fn help_flags() {
+        let h = "  --spec-ngram K   drafts\n  --api-key KEY  the key\n  --spec-ngram-min N  shortest";
+        assert!(help_has_flag(h, "--spec-ngram"));
+        assert!(!help_has_flag(h, "--api-key-env"), "--api-key must not read as --api-key-env");
+        assert!(!help_has_flag(h, "--spec"));
+        use std::os::unix::fs::PermissionsExt;
+        let bin = std::env::temp_dir().join(format!("llmduo-help-{}", std::process::id()));
+        std::fs::write(&bin, "#!/bin/sh\necho '  --api-key-env NAME  the key'\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(binary_has_flag(&bin, "--api-key-env"));
+        assert!(!binary_has_flag(&bin, "--allow-host"));
+        let _ = std::fs::remove_file(&bin);
+        assert!(!binary_has_flag(&bin, "--api-key-env"), "a binary that can't be asked has no flags");
+    }
+
+    #[test]
+    fn model_kinds() {
+        let mut r = RadInfo { summary_text: "  architecture  laya\n".into(), meta_text: "  decision.type  str  laya\n".into(), ..Default::default() };
+        r.parse();
+        assert_eq!((r.kind, r.decision.as_str()), (RadKind::Decision, "laya"));
+        assert!(r.summary().contains("decision model (laya)"));
+        // a decision model on an ordinary trunk (Mica on qwen35, d1 on lfm2)
+        let mut r = RadInfo { summary_text: "  architecture  qwen35_bf16\n".into(), meta_text: "  decision.type  str  mica\n".into(), ..Default::default() };
+        r.parse();
+        assert_eq!(r.kind, RadKind::Decision);
+        let mut r = RadInfo { summary_text: "  architecture  nemotron35_embed\n".into(), meta_text: format!("  architectures  str  {RERANK_ARCH}\n"), ..Default::default() };
+        r.parse();
+        assert_eq!(r.kind, RadKind::Rerank);
+        let mut r = RadInfo { summary_text: "  architecture  nemotron35_embed\n".into(), ..Default::default() };
+        r.parse();
+        assert_eq!(r.kind, RadKind::Embedding);
+        let mut r = RadInfo { summary_text: "  architecture  gemma4\n".into(), ..Default::default() };
+        r.parse();
+        assert_eq!(r.kind, RadKind::Generate);
+    }
+
+    #[test]
+    fn recipe_paths() {
+        let iq = "# run from the repository root (vq=data/codebooks/x.txt in a comment does not count)\n\
+                  blk.0.ssm_inz.weight gptq vq=data/codebooks/iqr-vq3-4x4096.txt group=128 calib=$CALIB\n";
+        assert!(recipe_needs_repo_cwd(iq) && recipe_needs_calib(iq));
+        let plain = "#   CALIB=<dir> rad-convert uses vq=data/codebooks/a.txt and $CALIB here\nblk.*.weight rtn codes=i8 group=128\n";
+        assert!(!recipe_needs_repo_cwd(plain) && !recipe_needs_calib(plain));
+    }
+
+    #[test]
+    fn decision_folders() {
+        let root = std::env::temp_dir().join(format!("llmduo-dec-{}", std::process::id()));
+        let (clef, laya, plain) = (root.join("clef"), root.join("nest/laya"), root.join("plain"));
+        std::fs::create_dir_all(&clef).unwrap();
+        std::fs::create_dir_all(laya.join("encoder")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(clef.join("joint_head_config.json"), "{}").unwrap();
+        std::fs::write(laya.join("rl_agent_config.json"), "{}").unwrap();
+        std::fs::write(laya.join("encoder/config.json"), "{}").unwrap();
+        std::fs::write(plain.join("config.json"), "{}").unwrap();
+        assert_eq!(decision_kind(&clef), Some("clef"));
+        assert_eq!(decision_kind(&laya), Some("laya"));
+        assert_eq!(decision_kind(&plain), None);
+        assert_eq!(scan_laya(&root.to_string_lossy()), vec![laya.clone()]);
+        std::fs::create_dir_all(root.join("r/data/recipes")).unwrap();
+        std::fs::create_dir_all(root.join("r/data/codebooks")).unwrap();
+        assert_eq!(repo_of_recipe(&root.join("r/data/recipes/a.recipe")), Some(root.join("r")));
+        assert_eq!(repo_of_recipe(&clef.join("a.recipe")), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

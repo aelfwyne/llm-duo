@@ -24,8 +24,14 @@ impl App {
     pub fn build_command(&mut self, p: usize) -> Result<(Vec<String>, Opts), String> {
         let (mut cmd, s) = self.build_command_base(p)?;
         if let Some((flag, key)) = self.server_secret(p) {
-            if !cmd.iter().any(|a| SECRET_FLAGS.iter().any(|f| a == f || a.starts_with(&format!("{f}=")))) {
-                cmd.extend([flag.to_string(), key]);
+            let given = cmd.iter().any(|a| a == "--api-key-env" || SECRET_FLAGS.iter().any(|f| a == f || a.starts_with(&format!("{f}="))));
+            if !given {
+                if self.r_key_in_env(p) {
+                    // on the command line every process on the machine could read it in ps
+                    cmd.extend(["--api-key-env".to_string(), super::radiance::RAD_KEY_ENV.to_string()]);
+                } else {
+                    cmd.extend([flag.to_string(), key]);
+                }
             }
         }
         Ok((cmd, s))
@@ -52,6 +58,13 @@ impl App {
     pub fn poll_token(&self, p: usize) -> Option<String> {
         let cmd = &self.panes[p].cmd;
         for (i, a) in cmd.iter().enumerate() {
+            if a == "--api-key-env" {
+                let name = cmd.get(i + 1)?;
+                if let Some(v) = self.panes[p].env_extra.iter().find(|e| &e.0 == name) {
+                    return Some(v.1.clone());
+                }
+                return std::env::var(name).ok();
+            }
             for f in SECRET_FLAGS {
                 if a == f {
                     return cmd.get(i + 1).cloned();
@@ -412,7 +425,7 @@ impl App {
         self.clear_log(p);
         let mut first = vec![format!(
             "$ {} {}",
-            env_extra.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "),
+            env_text(&env_extra),
             shlex_join(&mask_cmd(&cmd))
         )];
         if !self.panes[p].is_vllm() {
@@ -1131,7 +1144,7 @@ impl App {
             format!("GPU:       {dname} [{did}]"),
             format!("Model:     {}", self.model_path(p).map(|x| x.display().to_string()).unwrap_or("None".into())),
             format!("Exit code: {}", rc.map(|r| r.to_string()).unwrap_or("None".into())),
-            format!("Env:       {}", pane.env_extra.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")),
+            format!("Env:       {}", env_text(&pane.env_extra)),
             format!("Command:   {}", if pane.cmd.is_empty() { "(none)".into() } else { shlex_join(&mask_cmd(&pane.cmd)) }),
             String::new(),
             headline.to_string(),
@@ -1306,7 +1319,7 @@ impl App {
                 if pane.is_vllm() || pane.is_rad() { String::new() } else { format!(" ({})", self.kbuild(p)) }
             ),
             format!("Model:     {}", self.model_path(p).map(|x| x.display().to_string()).unwrap_or("None".into())),
-            format!("Env:       {}", pane.env_extra.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")),
+            format!("Env:       {}", env_text(&pane.env_extra)),
             format!("Command:   {}", if pane.cmd.is_empty() { "(not started)".into() } else { shlex_join(&mask_cmd(&pane.cmd)) }),
             format!("State:     {}", pane.state),
             format!("Last req:  {}", st("speed")),

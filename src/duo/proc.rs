@@ -4,6 +4,7 @@
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -55,8 +56,16 @@ fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd)> {
 /// Start `cmd` in its own session with the full environment `env`.
 /// With `pty`, output goes through a pseudo-terminal (KoboldCpp line-buffers there).
 pub fn spawn(cmd: &[String], env: &[(String, String)], pty: bool, tx: Sender<ProcMsg>) -> std::io::Result<Proc> {
+    spawn_in(cmd, env, pty, None, tx)
+}
+
+/// `spawn`, in the working directory `cwd` when one is given.
+pub fn spawn_in(cmd: &[String], env: &[(String, String)], pty: bool, cwd: Option<&Path>, tx: Sender<ProcMsg>) -> std::io::Result<Proc> {
     let mut c = Command::new(&cmd[0]);
     c.args(&cmd[1..]).env_clear().envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
     unsafe {
         c.pre_exec(|| {
             libc::setsid();

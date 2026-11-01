@@ -644,7 +644,7 @@ QQC2.Pane {
             OptLabel { text: "Max seqs"; help: pv.h("r_parallel") }
             OptSpin { pane: pv; key: "parallel"; from: 1; to: 256; help: pv.h("r_parallel") }
             OptLabel { text: "Batch tokens"; help: pv.h("r_batched") }
-            OptSpin { pane: pv; key: "r_batched"; from: 64; to: 65536; stepSize: 512; help: pv.h("r_batched") }
+            OptSpin { pane: pv; key: "r_batched"; from: 64; to: 262144; stepSize: 512; help: pv.h("r_batched") }
 
             OptLabel { text: "Spec tokens"; help: pv.h("r_spec") }
             OptCombo { pane: pv; key: "r_spec"; values: pv.lists.rSpec || []; help: pv.h("r_spec") }
@@ -693,6 +693,13 @@ QQC2.Pane {
                 }
                 HelpTip { text: pv.h("r_reasoning"); shown: rReasonBox.hovered && !rReasonBox.popup.visible }
             }
+
+            OptLabel { text: "Prompt lookup"; help: pv.h("r_spec_ngram") }
+            OptSpin { pane: pv; key: "r_spec_ngram"; from: 0; to: 64; help: pv.h("r_spec_ngram") }
+            OptLabel { text: "N-gram min"; help: pv.h("r_ngram") }
+            OptSpin { pane: pv; key: "r_ngram_min"; from: 1; to: 15; help: pv.h("r_ngram") }
+            OptLabel { text: "N-gram max"; help: pv.h("r_ngram") }
+            OptSpin { pane: pv; key: "r_ngram_max"; from: 1; to: 15; help: pv.h("r_ngram") }
 
             OptLabel { text: "Extra args"; help: pv.h("r_extra") }
             OptText {

@@ -171,8 +171,8 @@ pub fn default_vllm_model() -> Opts {
     .clone()
 }
 
-/// Radiance load options. Max seqs and Batch tokens default low: the engine's own defaults
-/// (256 / 8192) are for many-user serving and give most of the card to the activation arena.
+/// Radiance load options. Max seqs defaults low: the engine's own default (256) is for many-user
+/// serving, and every sequence takes a fixed cost out of the KV pool.
 pub fn default_rad_model() -> Opts {
     json!({
         "ctx": 32768,
@@ -181,6 +181,9 @@ pub fn default_rad_model() -> Opts {
         "r_batched": 2048,
         "r_headroom": 96,
         "r_spec": "auto",
+        "r_spec_ngram": 0,
+        "r_ngram_min": 2,
+        "r_ngram_max": 4,
         "r_draft_window": "fixed",
         "r_vision": "(default)",
         "r_embed": "(default)",

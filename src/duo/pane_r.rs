@@ -60,6 +60,10 @@ impl App {
         o.insert("r_batched".into(), v.int("r_batched", 2048).max(64).into());
         o.insert("r_headroom".into(), v.int("r_headroom", 96).max(0).into());
         o.insert("r_spec".into(), spec.into());
+        o.insert("r_spec_ngram".into(), v.int("r_spec_ngram", 0).clamp(0, 64).into());
+        let nmax = v.int("r_ngram_max", 4).clamp(1, 15);
+        o.insert("r_ngram_max".into(), nmax.into());
+        o.insert("r_ngram_min".into(), v.int("r_ngram_min", 2).clamp(1, nmax).into());
         o.insert("r_draft_window".into(), list_or(v.var_s("r_draft_window"), &RAD_DRAFT_WINDOW, "fixed").into());
         o.insert("r_vision".into(), list_or(v.var_s("r_vision"), &RAD_VISION, "(default)").into());
         o.insert("r_embed".into(), list_or(v.var_s("r_embed"), &RAD_EMBED, "(default)").into());
@@ -266,6 +270,22 @@ impl App {
                 yellow = true;
             }
         }
+        if gi(&s, "r_spec_ngram", 0) > 0 && info.draft {
+            warn.push("this container has a draft head, so Radiance refuses Prompt lookup at startup: set it to 0 and use Spec tokens".into());
+            yellow = true;
+        }
+        if matches!(info.kind, RadKind::Embedding | RadKind::Rerank) {
+            let ectx = if ctx == 0 { cap } else { ctx };
+            let batched = gi(&s, "r_batched", 2048);
+            if ectx > batched {
+                warn.push(format!(
+                    "Batch tokens ({}) is below Context ({}): this model reads each input whole in one step, so raise Batch tokens to the longest input you will send",
+                    fmt_thousands(batched),
+                    fmt_thousands(ectx)
+                ));
+                yellow = true;
+            }
+        }
         if !info.note.is_empty() {
             warn.push(info.note.clone());
         }
@@ -404,7 +424,7 @@ impl App {
         });
         let shown = format!(
             "$ {} {}",
-            env_extra.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "),
+            env_text(&env_extra),
             shlex_join(&cmd)
         );
         self.append_log(p, &[format!("[LLM Duo] Fit: plan check (stopped as soon as Radiance states its KV pool){}", if ctx > 0 { format!(" at context {}", fmt_thousands(ctx)) } else { String::new() }), shown]);
@@ -543,6 +563,12 @@ impl App {
             self.set_top_status(format!("{} pane: Fit's plan check failed - see the log", cap_side(self.panes[p].side)));
             return;
         }
+        let no_kv = pr.lines.iter().any(|l| rre().serving.is_match(l) && l.contains("completions and chat are 501"));
+        if no_kv {
+            self.r_probe_stop(p);
+            self.msg("info", "This model keeps no KV cache, so Fit doesn't apply. Context only has to cover the longest input you will send.");
+            return;
+        }
         if serving || pr.t0.elapsed() > PROBE_TIMEOUT {
             self.r_probe_stop(p);
             self.msg(
@@ -592,9 +618,8 @@ impl App {
         if gi(&s, "r_headroom", 96) != 96 {
             push("--gpu-headroom-mib", gi(&s, "r_headroom", 96).to_string());
         }
-        let spec = gs(&s, "r_spec", "auto");
-        if spec != "auto" {
-            push("--num-speculative-tokens", spec);
+        for (flag, v) in spec_flags(&s) {
+            push(flag, v);
         }
         if gs(&s, "r_draft_window", "fixed") == "adaptive" {
             push("--draft-window", "adaptive".into());
@@ -663,8 +688,21 @@ impl App {
                 }
             }
         }
+        if self.r_key_in_env(p) {
+            if let Some((_, key)) = self.server_secret(p) {
+                set(&mut env, RAD_KEY_ENV, key);
+            }
+        }
         self.panes[p].r_devs = devs;
         env
+    }
+
+    /// This pane's API key goes in the environment: Radiance 1.15.1 and later take it there.
+    pub fn r_key_in_env(&self, p: usize) -> bool {
+        self.panes[p].is_rad() && {
+            let bin = expanduser(&gs(self.settings.g(), "radiance_bin", "radiance"));
+            binary_has_flag(&bin, "--api-key-env")
+        }
     }
 
     pub fn r_monitors(&self, p: usize) -> Vec<Mon> {
@@ -829,8 +867,18 @@ impl App {
         if g("radiance:draft_tokens_total") > 0.0 {
             avg.push(format!("draft acceptance {:.0}%", 100.0 * g("radiance:draft_accepted_total") / g("radiance:draft_tokens_total")));
         }
+        if g("radiance:lookup_proposals_total") > 0.0 {
+            avg.push(format!(
+                "prompt lookup {} proposals, {} held back",
+                fmt_thousands(g("radiance:lookup_proposals_total") as i64),
+                fmt_thousands(g("radiance:lookup_held_total") as i64)
+            ));
+        }
         if g("radiance:num_requests_preempted") > 0.0 {
             avg.push(format!("{} preempted", g("radiance:num_requests_preempted") as i64));
+        }
+        if g("radiance:preempt_forced_total") > 0.0 {
+            avg.push(format!("{} forced preemptions", g("radiance:preempt_forced_total") as i64));
         }
         self.panes[p].set_status("avg", if avg.is_empty() { "—".into() } else { avg.join("   •   ") });
 
@@ -953,6 +1001,24 @@ impl App {
     }
 }
 
+/// The speculation flags. `--spec-ngram` sets the window itself: another value beside it is refused.
+fn spec_flags(s: &Opts) -> Vec<(&'static str, String)> {
+    let mut out = vec![];
+    let spec = gs(s, "r_spec", "auto");
+    if gi(s, "r_spec_ngram", 0) > 0 {
+        out.push(("--spec-ngram", gi(s, "r_spec_ngram", 0).to_string()));
+    } else if spec != "auto" {
+        out.push(("--num-speculative-tokens", spec));
+    }
+    if gi(s, "r_ngram_min", 2) != 2 {
+        out.push(("--spec-ngram-min", gi(s, "r_ngram_min", 2).to_string()));
+    }
+    if gi(s, "r_ngram_max", 4) != 4 {
+        out.push(("--spec-ngram-max", gi(s, "r_ngram_max", 4).to_string()));
+    }
+    out
+}
+
 /// What a recorded plan says the card could hold: the budget table's figure, or the pool itself
 /// when the card (not Context × Max seqs) limited it. None: the pool was only what was asked for.
 pub fn pool_capacity(pl: &Opts) -> Option<i64> {
@@ -979,6 +1045,18 @@ fn _p(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spec() {
+        let o = |v: Value| v.as_object().unwrap().clone();
+        assert!(spec_flags(&o(json!({"r_spec": "auto", "r_spec_ngram": 0, "r_ngram_min": 2, "r_ngram_max": 4}))).is_empty());
+        assert_eq!(spec_flags(&o(json!({"r_spec": "4"}))), vec![("--num-speculative-tokens", "4".to_string())]);
+        assert_eq!(spec_flags(&o(json!({"r_spec": "4", "r_spec_ngram": 5}))), vec![("--spec-ngram", "5".to_string())]);
+        assert_eq!(
+            spec_flags(&o(json!({"r_spec": "4", "r_ngram_min": 3, "r_ngram_max": 8}))),
+            vec![("--num-speculative-tokens", "4".to_string()), ("--spec-ngram-min", "3".to_string()), ("--spec-ngram-max", "8".to_string())]
+        );
+    }
+
     #[test]
     fn fit_ctx() {
         assert_eq!(r_fit_ctx(262160, 1, 262144), 262144);

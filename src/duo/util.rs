@@ -550,6 +550,14 @@ mod tests {
 pub const SECRET_FLAGS: [&str; 2] = ["--api-key", "--password"];
 
 /// A command line for showing (log, reports): every API key / password replaced by ••••.
+/// `K=V K=V` for display, with values that hold a secret masked.
+pub fn env_text(env: &[(String, String)]) -> String {
+    env.iter()
+        .map(|(k, v)| if k.ends_with("API_KEY") { format!("{k}=••••") } else { format!("{k}={v}") })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn mask_cmd(cmd: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(cmd.len());
     let mut hide = false;
@@ -576,5 +584,7 @@ mod mask_tests {
     fn masks() {
         let c: Vec<String> = ["srv", "--api-key", "abc", "--port", "1", "--password=x"].iter().map(|s| s.to_string()).collect();
         assert_eq!(mask_cmd(&c), vec!["srv", "--api-key", "••••", "--port", "1", "--password=••••"]);
+        let e = [("A".to_string(), "1".to_string()), ("RADIANCE_API_KEY".to_string(), "abc".to_string())];
+        assert_eq!(env_text(&e), "A=1 RADIANCE_API_KEY=••••");
     }
 }

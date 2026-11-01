@@ -150,12 +150,12 @@ pub struct Mon {
 }
 
 pub const BOOL_VARS: [&str; 6] = ["jinja", "relax_tpl", "dual_moe_spread", "eager", "text_only", "kquiet"];
-pub const ALL_VARS: [&str; 45] = [
+pub const ALL_VARS: [&str; 48] = [
     "ctx", "ngl", "fa", "kv", "n_cpu_moe", "parallel", "threads", "batch", "ubatch", "port", "jinja", "relax_tpl",
     "dual_strategy", "dual_mode", "dual_ts", "dual_first", "dual_moe_spread", "mmproj", "mtp", "mtp_n", "extra",
     "gpu_util", "kv_dtype", "dtype", "max_batched", "cpu_offload", "eager", "text_only", "reasoning", "quant", "kbuild",
     // Radiance
-    "r_kv", "r_batched", "r_headroom", "r_spec", "r_draft_window", "r_vision", "r_embed", "r_placement", "r_host_pool",
+    "r_kv", "r_batched", "r_headroom", "r_spec", "r_spec_ngram", "r_ngram_min", "r_ngram_max", "r_draft_window", "r_vision", "r_embed", "r_placement", "r_host_pool",
     "r_prefix_mib", "r_prefill_span", "r_reasoning", "r_tp_wire",
     // llama.cpp Dual GPU: the card the MTP drafter runs on ("(auto)" or a device id)
     "mtp_dev",

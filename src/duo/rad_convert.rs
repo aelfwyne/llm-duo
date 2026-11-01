@@ -10,7 +10,10 @@ use std::time::Instant;
 
 use super::app::{App, Pending};
 use super::proc::{self, Proc, ProcMsg};
-use super::radiance::{bf16_plugin_mismatch, checkpoint_kind, known_sets, list_recipes, recipe_kind, recipe_sets, sets_text, tool_path, Recipe};
+use super::radiance::{
+    bf16_plugin_mismatch, checkpoint_kind, decision_kind, known_sets, list_recipes, recipe_kind, recipe_needs_calib, recipe_needs_repo_cwd,
+    recipe_sets, repo_of_recipe, scan_laya, sets_text, tool_path, Recipe,
+};
 use super::util::*;
 
 pub const NO_RECIPE: &str = "(none: keep the checkpoint's own encodings)";
@@ -95,8 +98,12 @@ impl Default for Conv {
     }
 }
 
+/// A checkpoint's weights; a Laya release keeps its own in `encoder/`.
 fn dir_size(d: &std::path::Path) -> f64 {
     let mut t = 0.0;
+    if d.join("encoder").is_dir() {
+        t += dir_size(&d.join("encoder"));
+    }
     if let Ok(rd) = std::fs::read_dir(d) {
         for e in rd.filter_map(|e| e.ok()) {
             let n = e.file_name().to_string_lossy().to_lowercase();
@@ -154,6 +161,11 @@ impl App {
                     src.push(full);
                 }
             }
+            for laya in scan_laya(&root) {
+                // the folder itself, not the encoder inside it
+                src.retain(|s| !std::path::Path::new(s).starts_with(&laya));
+                src.push(laya.to_string_lossy().into_owned());
+            }
         }
         if !self.conv.src.is_empty() && !src.contains(&self.conv.src) {
             src.insert(0, self.conv.src.clone()); // a folder picked by hand stays in the list
@@ -191,6 +203,17 @@ impl App {
     /// the recipe header's own keys first; else, for a bf16 checkpoint whose trunk the recipe
     /// quantises, the keys that select the family's quantised serving plugin.
     fn conv_suggest_sets(&self) -> (Option<Vec<String>>, String) {
+        let (sets, note) = self.conv_recipe_sets();
+        let Some(kind) = decision_kind(&PathBuf::from(&self.conv.src)) else { return (sets, note) };
+        let mut all = sets.unwrap_or_default();
+        if !all.iter().any(|s| s.starts_with("decision.type=")) {
+            all.insert(0, format!("decision.type={kind}"));
+        }
+        let what = format!("a {kind} decision checkpoint: served on /v1/systemone");
+        (Some(all), if note.is_empty() { what } else { format!("{what}; {note}") })
+    }
+
+    fn conv_recipe_sets(&self) -> (Option<Vec<String>>, String) {
         let Some(r) = self.conv.recipes.iter().find(|r| r.name == self.conv.recipe) else { return (None, String::new()) };
         let header = recipe_sets(&r.about);
         if !header.is_empty() {
@@ -302,7 +325,7 @@ impl App {
             if src.is_dir() || src.is_file() {
                 let sz = if src.is_dir() { dir_size(&src) } else { std::fs::metadata(&src).map(|m| m.len() as f64).unwrap_or(0.0) };
                 parts.push(format!("source {:.1} GiB", sz / GIB));
-                if src.is_dir() && !src.join("config.json").is_file() {
+                if src.is_dir() && !src.join("config.json").is_file() && decision_kind(&src).is_none() {
                     parts.push("⚠ no config.json in that folder".into());
                 }
             } else {
@@ -321,11 +344,29 @@ impl App {
         if self.conv.recipe == NO_RECIPE {
             parts.push("no recipe: bf16 / f16 / block-fp8 weights are kept as they are".into());
         }
-        if self.conv.env.contains("CALIB") || self.conv.recipes.iter().any(|r| r.name == self.conv.recipe && r.about.contains("$CALIB")) {
-            parts.push("this recipe reads calibration data: set CALIB=<dir> in Environment".into());
+        let recipe = self.conv.recipes.iter().find(|r| r.name == self.conv.recipe);
+        if recipe.is_some_and(|r| recipe_needs_calib(&r.text)) && !self.conv.env.contains("CALIB=") && std::env::var_os("CALIB").is_none() {
+            parts.push("⚠ this recipe reads calibration data: set CALIB=<dir> in Environment".into());
+        }
+        if recipe.is_some_and(|r| recipe_needs_repo_cwd(&r.text) && repo_of_recipe(&r.path).is_none()) {
+            parts.push("⚠ this recipe reads data/codebooks/… and that folder isn't beside the recipes folder".into());
+        }
+        if decision_kind(&src) == Some("clef") && !self.conv_has_arch() {
+            parts.push("clef: --arch clef and its joint_head.safetensors are added".into());
         }
         self.conv.info = parts.join("   •   ");
         self.conv.about = self.conv.recipes.iter().find(|r| r.name == self.conv.recipe).map(|r| r.about.clone()).unwrap_or_default();
+    }
+
+    /// Extra args name the architecture themselves: LLM Duo adds none of its own.
+    fn conv_has_arch(&self) -> bool {
+        shlex_split(&self.conv.extra).unwrap_or_default().iter().any(|a| a == "--arch")
+    }
+
+    /// Where a recipe's repository-relative data files can be opened from.
+    fn conv_cwd(&self) -> Option<PathBuf> {
+        let r = self.conv.recipes.iter().find(|r| r.name == self.conv.recipe)?;
+        if recipe_needs_repo_cwd(&r.text) { repo_of_recipe(&r.path) } else { None }
     }
 
     fn conv_command(&self) -> Result<(Vec<String>, Vec<(String, String)>), String> {
@@ -337,7 +378,9 @@ impl App {
             return Err("Pick a source checkpoint folder.".into());
         }
         let out = if c.plan_only { PathBuf::from("/dev/null") } else { self.conv_target().ok_or("Name the output file.")? };
-        let mut cmd = vec![tool.to_string_lossy().into_owned(), c.src.clone(), "-o".into(), out.to_string_lossy().into_owned()];
+        // absolute, because a recipe with repository-relative files runs from the repository
+        let abs = |p: PathBuf| std::path::absolute(&p).unwrap_or(p).to_string_lossy().into_owned();
+        let mut cmd = vec![tool.to_string_lossy().into_owned(), abs(expanduser(c.src.trim())), "-o".into(), abs(out)];
         if c.recipe != NO_RECIPE {
             let r = c.recipes.iter().find(|r| r.name == c.recipe).ok_or("That recipe is no longer in the recipes folder.")?;
             cmd.extend(["--recipe".into(), r.path.to_string_lossy().into_owned()]);
@@ -353,7 +396,7 @@ impl App {
             cmd.extend(["--set".into(), kv]);
         }
         if !c.draft.trim().is_empty() {
-            cmd.extend(["--draft-model".into(), expanduser(c.draft.trim()).to_string_lossy().into_owned()]);
+            cmd.extend(["--draft-model".into(), abs(expanduser(c.draft.trim()))]);
         }
         if !c.max_ctx.trim().is_empty() {
             let n: i64 = c.max_ctx.trim().replace(['_', ','], "").parse().map_err(|_| "Max context must be a number.")?;
@@ -361,6 +404,13 @@ impl App {
         }
         if c.plan_only {
             cmd.extend(["--plan-only".into(), "-v".into()]);
+        }
+        if decision_kind(&PathBuf::from(&c.src)) == Some("clef") && !self.conv_has_arch() {
+            cmd.extend(["--arch".into(), "clef".into()]);
+            let head = PathBuf::from(&c.src).join("joint_head.safetensors");
+            if head.is_file() {
+                cmd.extend(["--add".into(), abs(head)]);
+            }
         }
         cmd.extend(shlex_split(&c.extra)?);
         let mut env: Vec<(String, String)> = std::env::vars().collect();
@@ -410,9 +460,11 @@ impl App {
         self.push_event(json!({"type": "logClear", "side": "convert"}));
         self.conv.lines.clear();
         let hip = env.iter().find(|e| e.0 == "HIP_VISIBLE_DEVICES").map(|e| format!("HIP_VISIBLE_DEVICES={} ", e.1)).unwrap_or_default();
-        self.conv_log(&format!("$ {hip}{}", shlex_join(&cmd)));
+        let cwd = self.conv_cwd();
+        let cd = cwd.as_ref().map(|d| format!("cd {} && ", shlex_quote(&d.to_string_lossy()))).unwrap_or_default();
+        self.conv_log(&format!("$ {cd}{hip}{}", shlex_join(&cmd)));
         while self.conv.rx.try_recv().is_ok() {}
-        match proc::spawn(&cmd, &env, false, self.conv.tx.clone()) {
+        match proc::spawn_in(&cmd, &env, false, cwd.as_deref(), self.conv.tx.clone()) {
             Ok(pr) => self.conv.proc = Some(pr),
             Err(e) => {
                 self.conv_log(&format!("Failed to start rad-convert: {e}\n(set the Radiance binary in Settings: rad-convert is looked for beside it)"));

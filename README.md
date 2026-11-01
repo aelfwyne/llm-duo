@@ -168,9 +168,19 @@ Every real load records the figure as well. Spill detection and VRAM calibration
 Radiance, because it pins host memory on purpose (the embedding, and the vision tower set to
 `ram`).
 
-**Defaults.** Max seqs is 1 and Batch tokens is 2048, because the engine's own 256 / 8192 leave
-only a few thousand tokens of context on a 32 GB card. KV cache defaults to fp8; the engine's
-default is bf16.
+**Defaults.** Max seqs is 1, because the engine's own 256 leaves only a few thousand tokens of
+context on a 32 GB card. KV cache defaults to fp8; the engine's default is bf16.
+
+**Prompt lookup** (Radiance 1.15) drafts from the sequence's own n-grams with no draft model. Set
+Prompt lookup to the most drafts a step; it replaces Spec tokens while it is on. A container with
+a draft head refuses it, so use Spec tokens there, and lookup fills in where the head declines.
+
+**Embedding, rerank and decision models** load like any other and show their endpoints in the
+model summary. Embedding and rerank models read each input whole, so Batch tokens has to reach the
+longest input. A model with no KV cache has nothing for Fit to measure, and Fit says so.
+
+**API key.** With Radiance 1.15.1 or later, the key from Settings reaches the server through
+`--api-key-env`, so it doesn't show in `ps`. Older builds get `--api-key` on the command line.
 
 **Dual GPU mode** runs `--tp 2` (tensor parallel), because Radiance has no layer split. The KV
 pool is sized to the tighter card, so an R9700 + 9070 XT pair usually holds less context than the
@@ -187,6 +197,12 @@ folder. It takes a recipe from the recipes folder, read each time the window ope
 the `--set` keys the recipe's header asks for. It can also add a draft model, a max context, an
 environment (such as `CALIB=`) and plan-only. The new container appears in the model list when it
 finishes.
+
+Recipes that read `$CALIB` show a warning until it is set, and those that use repository-relative
+codebooks run from the Radiance checkout, so the recipes folder has to stay inside it. Decision
+checkpoints are recognised: clef gets `decision.type=clef`, `--arch clef` and its
+`joint_head.safetensors`, and Laya gets `decision.type=laya`. Laya folders with no `config.json`
+are listed too. Naming `--arch` in Extra args turns the clef additions off.
 
 The log parsing is written from Radiance's documentation, not a live log. If a status line stays
 empty or Fit says it couldn't read the pool, send the startup log and the parser can be adjusted.
@@ -219,3 +235,30 @@ The logic in `src/duo` has unit tests that run without Qt:
 ```bash
 cargo test     # needs the Qt dev packages too, since the crate links Qt
 ```
+
+## Changelog
+
+### Unreleased
+
+Added:
+
+- Prompt lookup, N-gram min and N-gram max controls for Radiance 1.15.
+- Prompt lookup and forced preemption figures in the Radiance status line.
+- Model kind and endpoints in the model summary, for embedding, rerank and decision models.
+- clef and Laya recognised in Convert, with Laya folders listed as sources.
+- A Batch tokens limit of 262144, and a warning when it's too low for an embedding or rerank model.
+
+Changed:
+
+- With Radiance 1.15.1 or later, the API key goes through `--api-key-env`, so it doesn't show in
+  `ps`. It is also masked in the log and reports.
+
+Fixed:
+
+- Recipes with repository-relative codebooks run from the Radiance checkout, instead of failing
+  with `vq=… cannot be opened`.
+- The `CALIB` warning appears for recipes that need it.
+- Startup refusals show the real reason: CWSR, plugin refusals, `--spec-ngram` and `--api-key-env`.
+- Fit says when a model has no KV cache, instead of asking for a startup log.
+- Prefix-cache log lines no longer overwrite the KV pool figure.
+- Stale Radiance help text.
