@@ -943,6 +943,7 @@ impl App {
                 "live" => self.dash_live(arg),
                 "history" => self.dash_history(arg),
                 "delete" => self.dash_delete(arg),
+                "restore" => self.dash_restore(arg),
                 _ => Value::Null,
             };
         }

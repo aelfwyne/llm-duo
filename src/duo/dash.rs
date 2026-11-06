@@ -95,6 +95,103 @@ fn insight(id: &str, scope: &str, level: &str, title: &str, text: String) -> Val
     json!({"id": id, "scope": scope, "level": level, "title": title, "text": text})
 }
 
+/// Display order of load options in the history window (keys not listed come last, sorted).
+const OPT_ORDER: [&str; 48] = [
+    "ctx", "ngl", "n_cpu_moe", "fa", "kv", "kv_dtype", "r_kv", "dtype", "quant", "gpu_util", "parallel", "batch", "ubatch",
+    "max_batched", "r_batched", "threads", "cpu_offload", "mtp", "mtp_n", "r_spec", "r_draft_window", "r_spec_ngram",
+    "r_ngram_min", "r_ngram_max", "r_headroom", "r_vision", "r_embed", "r_placement", "r_host_pool", "r_prefix_mib",
+    "r_prefill_span", "mmproj", "reasoning", "r_reasoning", "jinja", "relax_tpl", "eager", "text_only", "dual_strategy",
+    "dual_mode", "dual_ts", "dual_first", "dual_moe_spread", "mtp_dev", "r_tp_wire", "extra", "kbuild", "kquiet",
+];
+
+/// The label the main window shows for a load option.
+fn opt_label(k: &str, backend: &str) -> String {
+    let vl = backend == "vLLM";
+    let rad = backend == "Radiance";
+    match k {
+        "ctx" => "Context",
+        "ngl" => "GPU layers",
+        "n_cpu_moe" => "CPU MoE",
+        "fa" => "Flash attn",
+        "kv" | "kv_dtype" | "r_kv" => "KV cache",
+        "dtype" => "Dtype",
+        "quant" => "Quantize",
+        "gpu_util" => "GPU memory",
+        "parallel" if vl || rad => "Max seqs",
+        "parallel" => "Parallel",
+        "batch" => "Batch",
+        "ubatch" => "UBatch",
+        "max_batched" | "r_batched" => "Batch tokens",
+        "threads" => "Threads",
+        "cpu_offload" => "CPU offload",
+        "mtp" if vl => "MTP",
+        "mtp" => "MTP drafter",
+        "mtp_n" if vl => "Spec tokens",
+        "mtp_n" => "Draft max",
+        "r_spec" => "Spec tokens",
+        "r_draft_window" => "Draft window",
+        "r_spec_ngram" => "Prompt lookup",
+        "r_ngram_min" => "N-gram min",
+        "r_ngram_max" => "N-gram max",
+        "r_headroom" => "Headroom",
+        "r_vision" => "Vision tower",
+        "r_embed" => "Embedding",
+        "r_placement" => "Placement",
+        "r_host_pool" => "Host pool",
+        "r_prefix_mib" => "Prefix cache",
+        "r_prefill_span" => "Prefill span",
+        "mmproj" => "mmproj",
+        "reasoning" | "r_reasoning" => "Reasoning",
+        "jinja" => "--jinja",
+        "relax_tpl" => "Relaxed tpl",
+        "eager" => "Eager",
+        "text_only" => "Text only",
+        "dual_strategy" => "Strategy",
+        "dual_mode" => "Split mode",
+        "dual_ts" => "Split ratio",
+        "dual_first" => "First layers on",
+        "dual_moe_spread" => "Spread CPU MoE",
+        "mtp_dev" => "Drafter card",
+        "r_tp_wire" => "Tensor parallel wire",
+        "extra" => "Extra args",
+        "kbuild" => "Build",
+        "kquiet" => "Quiet log",
+        _ => return k.to_string(),
+    }
+    .to_string()
+}
+
+/// A load option's value as text for the history window.
+fn opt_text(k: &str, v: &Value) -> String {
+    match v {
+        Value::Bool(b) => (if *b { "on" } else { "off" }).into(),
+        Value::Number(n) if k == "ctx" => n.as_i64().map(fmt_thousands).unwrap_or_else(|| n.to_string()),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) if k == "mtp" || k == "mmproj" => {
+            // a drafter / projector file: its name is enough
+            let base = s.rsplit('/').next().unwrap_or(s);
+            base.strip_suffix(".gguf").unwrap_or(base).to_string()
+        }
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Every recorded load option of a configuration, in display order: [{k, label, v}].
+/// Dual GPU options are only listed for Dual GPU setups (they are stored for every setup).
+fn opt_list(fp: &Opts, backend: &str, dual: bool) -> Vec<Value> {
+    let mut keys: Vec<&String> = fp.keys().collect();
+    let pos = |k: &str| OPT_ORDER.iter().position(|o| *o == k).unwrap_or(OPT_ORDER.len());
+    keys.sort_by(|a, b| pos(a).cmp(&pos(b)).then(a.cmp(b)));
+    keys.into_iter()
+        .filter(|k| dual || !(k.starts_with("dual_") || *k == "r_tp_wire" || *k == "mtp_dev"))
+        .filter(|k| !(backend == "Radiance" && k.starts_with("dual_"))) // fixed for Radiance
+        .map(|k| json!({"k": k, "label": opt_label(k, backend), "v": opt_text(k, &fp[k.as_str()])}))
+        .filter(|o| o["v"].as_str().map(|s| !s.trim().is_empty()).unwrap_or(false))
+        .collect()
+}
+
 /// One configuration row for the history dashboard, from a stats object.
 fn stats_row(key: &str, rel: &str, st: &Opts, status: &str) -> Value {
     let (backend, build, hw, dual) = describe_key(key);
@@ -133,6 +230,8 @@ fn stats_row(key: &str, rel: &str, st: &Opts, status: &str) -> Value {
         "genTokens": gi(st, "gen_tokens", 0), "promptTokens": gi(st, "prompt_tokens", 0),
         "since": gs(st, "since", ""), "last": st.get("last").cloned().unwrap_or(Value::Null),
         "setup": setup,
+        "optList": opt_list(&fp, &backend, dual),
+        "opts": fp,
     })
 }
 
@@ -296,6 +395,95 @@ impl App {
     }
 
     // ================================================================ live ==
+    /// The pane a history key belongs to now (same GPU(s) and backend), and for llama.cpp /
+    /// KoboldCpp the build the key names (keys carry the build; the pane may be set to the other).
+    fn restore_target(&self, key: &str) -> Option<(usize, Option<&'static str>)> {
+        for p in 0..2 {
+            if (p == 1 && self.dual_on()) || self.panes[p].pane_disabled {
+                continue;
+            }
+            if self.panes[p].device.is_none() && !self.dual_active(p) {
+                continue;
+            }
+            let pane = &self.panes[p];
+            if pane.is_kobold() || pane.is_llama() {
+                let base = self.dev_base(p);
+                for b in super::consts::KOBOLD_BUILDS {
+                    let k = if pane.is_kobold() {
+                        format!("Kobold-{b}:{base}")
+                    } else if b == "Vulkan" {
+                        format!("Vulkan:{base}")
+                    } else {
+                        base.clone()
+                    };
+                    if k == key {
+                        return Some((p, Some(b)));
+                    }
+                }
+            } else if self.dev_key(p) == key {
+                return Some((p, None));
+            }
+        }
+        None
+    }
+
+    /// What a configuration's options are compared with in the detail view: the pane it belongs
+    /// to, with the options it has now for that model (on screen if selected, else saved).
+    fn restore_compare(&self, key: &str, rel: &str) -> Value {
+        let Some((p, build)) = self.restore_target(key) else { return Value::Null };
+        let pane = &self.panes[p];
+        let (mut o, shown) = if pane.model_var == rel {
+            (self.current_options(p), true)
+        } else if pane.models.iter().any(|m| m == rel) {
+            (self.saved_options(p, rel), false)
+        } else {
+            return json!({"side": pane.side, "missing": true});
+        };
+        o.retain(|k, _| !super::consts::STATS_IGNORE.contains(&k.as_str()));
+        let text: Map<String, Value> = o.iter().map(|(k, v)| (k.clone(), Value::from(opt_text(k, v)))).collect();
+        json!({"side": pane.side, "opts": text, "shown": shown, "running": pane.proc.is_some(),
+               "sameBuild": build.map(|b| b == self.kbuild(p)).unwrap_or(true)})
+    }
+
+    /// Put a configuration's recorded load options back: they become that model's saved options
+    /// on the pane with the same GPU(s) and backend, and the model is selected there.
+    pub fn dash_restore(&mut self, arg: &Value) -> Value {
+        let s = |k: &str| arg.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (key, model) = (s("key"), s("model"));
+        let Some(opts) = arg.get("opts").and_then(|v| v.as_object()).filter(|o| !o.is_empty()).cloned() else {
+            return json!({"error": "This configuration has no recorded load options."});
+        };
+        let Some((p, build)) = self.restore_target(&key) else {
+            let (backend, b, hw, _) = describe_key(&key);
+            let what = if backend == "llama.cpp" || backend == "KoboldCpp" { format!("{backend} ({b})") } else { backend };
+            return json!({"error": format!("Neither pane runs {what} on {hw} right now. Set that up in Settings, then restore.")});
+        };
+        let side = self.panes[p].side;
+        if self.panes[p].proc.is_some() {
+            return json!({"error": format!("The {side} pane is running a model - stop it first, then restore.")});
+        }
+        if !self.panes[p].models.iter().any(|m| *m == model) {
+            return json!({"error": format!("{model} is no longer in the {side} pane's models folder.")});
+        }
+        self.flush_save(p);
+        let mut merged = self.saved_options(p, &model);
+        for (k, v) in opts {
+            if !super::consts::STATS_IGNORE.contains(&k.as_str()) {
+                merged.insert(k, v);
+            }
+        }
+        if let Some(b) = build {
+            merged.insert("kbuild".into(), b.into());
+        }
+        let dk = self.dev_key(p);
+        self.settings.set_model(&dk, &model, merged);
+        self.panes[p].model_var = model.clone();
+        self.on_model_selected(p);
+        let label = model.strip_suffix(".gguf").unwrap_or(&model);
+        self.set_top_status(format!("{} pane: restored the load options of {label} from the history", cap_side(side)));
+        json!({"ok": true, "msg": format!("Restored into the {side} pane - {label} is selected with these options.")})
+    }
+
     /// Delete one configuration from the history: its running totals (a current row) or its
     /// retired totals line (an earlier row), and every event recorded for it in that period.
     pub fn dash_delete(&mut self, arg: &Value) -> Value {
@@ -736,8 +924,11 @@ impl App {
             }
         }
         let keep = detail_reqs.len().saturating_sub(2000);
-        let detail = want_kr.map(|(k, r)| json!({"key": k, "model": r, "id": want, "requests": detail_reqs.split_off(keep),
-                                                 "events": detail_events}));
+        let detail = want_kr.map(|(k, r)| {
+            let compare = self.restore_compare(&k, &r);
+            json!({"key": k, "model": r, "id": want, "requests": detail_reqs.split_off(keep),
+                   "events": detail_events, "compare": compare})
+        });
         // totals
         let tot = |k: &str| rows.iter().map(|r| r[k].as_f64().unwrap_or(0.0)).sum::<f64>();
         let models: std::collections::HashSet<&str> = rows.iter().filter_map(|r| r["model"].as_str()).collect();
@@ -769,6 +960,16 @@ mod tests {
         assert!(r.iter().all(|x| !truthy(x.get("aborted"))), "{r:?}");
         assert_eq!(r[1]["gTok"], 1312);
         assert!(app.panes[0].dash_active.is_none());
+    }
+    #[test]
+    fn option_list() {
+        let fp = json!({"extra": "", "kv": "q8_0", "ctx": 32768, "jinja": true, "dual_mode": "layer",
+                        "mtp": "sub/Model-MTP.gguf", "parallel": 2}).as_object().unwrap().clone();
+        let l = opt_list(&fp, "llama.cpp", false);
+        let shown: Vec<String> = l.iter().map(|o| format!("{} {}", o["label"].as_str().unwrap(), o["v"].as_str().unwrap())).collect();
+        assert_eq!(shown, ["Context 32,768", "KV cache q8_0", "Parallel 2", "MTP drafter Model-MTP", "--jinja on"]);
+        assert!(opt_list(&fp, "llama.cpp", true).iter().any(|o| o["k"] == "dual_mode"));
+        assert_eq!(opt_list(&fp, "vLLM", false)[2]["label"], "Max seqs");
     }
     #[test]
     fn keys() {

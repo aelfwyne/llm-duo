@@ -124,10 +124,50 @@ QQC2.ApplicationWindow {
         }
     }
     function select(r) {
+        restoreMsg = ""
         sel = r
         refresh()
     }
     onVisibleChanged: if (visible) refresh()
+
+    // ---- load options of a configuration (r.optList: [{k, label, v}] in display order) ----
+    function optMap(r) {
+        const m = {}
+        for (const o of (r.optList || [])) m[o.k] = o.v
+        return m
+    }
+    // options whose value is not the same in every setup of this model on this backend
+    function varying(r) {
+        const maps = (d.rows || []).filter(x => x.model === r.model && bkey(x) === bkey(r)).map(optMap)
+        if (maps.length < 2) return []
+        const keys = new Set()
+        for (const m of maps) for (const k in m) keys.add(k)
+        return Array.from(keys).filter(k => maps.some(m => m[k] !== maps[0][k]))
+    }
+    function chunk(items) {
+        let out = []
+        for (let i = 0; i < items.length; i += 4) out.push("  " + items.slice(i, i + 4).join("  •  "))
+        return out.join("\n")
+    }
+    function settingsTip(r) {
+        const opts = r.optList || []
+        if (!opts.length) return ""
+        const vary = varying(r)
+        const a = opts.filter(o => vary.indexOf(o.k) >= 0).map(o => o.label + " " + o.v)
+        const b = opts.filter(o => vary.indexOf(o.k) < 0).map(o => o.label + " " + o.v)
+        let t = ""
+        if (a.length) t += "\n\nDiffers between this model's setups:\n" + chunk(a)
+        if (b.length) t += "\n\n" + (a.length ? "Same in all of them:\n" : "Load options:\n") + chunk(b)
+        return t
+    }
+    property string restoreMsg: ""
+    property bool restoreErr: false
+    function restore(r) {
+        const res = JSON.parse(Backend.call("dash", "restore", JSON.stringify({ key: r.key, model: r.model, opts: r.opts || {} })))
+        restoreErr = !!(res && res.error)
+        restoreMsg = res ? (res.error || res.msg || "") : ""
+        refresh()
+    }
 
     function label(r) { return r.model.replace(/\.gguf$/i, "") }
     function hw(r) { return r.hardware + "  •  " + bkey(r) }
@@ -302,6 +342,7 @@ QQC2.ApplicationWindow {
                                 QQC2.ToolTip.text: win.label(r) + "\n" + win.hw(r) + "\n" + th.fmt(r.genTps, 1) + " t/s generation"
                                                    + (r.genMin !== null ? " (" + th.fmt(r.genMin, 1) + "–" + th.fmt(r.genMax, 1) + ")" : "")
                                                    + "\n" + th.fmt(r.promptTps, 0) + " t/s prompt  •  " + th.fmt(r.requests) + " requests"
+                                                   + win.settingsTip(r)
                             }
                         }
                         QQC2.Button {
@@ -331,25 +372,81 @@ QQC2.ApplicationWindow {
                 title: r.model ? win.label(r) : ""
                 subtitle: r.model ? win.hw(r) + "  •  " + (r.status === "earlier" ? "earlier settings (replaced " + win.day(r.retired) + ")" : "current settings") : ""
                 swatch: r.model ? win.bcolor(r) : "transparent"
+                // what these options are compared with: the pane with the same GPU(s) and backend
+                readonly property var cmp: (win.detail && win.detail.compare) || null
+                readonly property var cmpOpts: cmp && cmp.opts ? cmp.opts : null
+                readonly property var changed: (r.optList || []).filter(o => cmpOpts && cmpOpts[o.k] !== undefined && cmpOpts[o.k] !== o.v)
+                readonly property string sideName: cmp && cmp.side ? cmp.side : ""
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.largeSpacing
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        color: th.text2
+                        text: {
+                            const n = (detailCard.r.optList || []).length
+                            if (!n) return "No load options recorded for this configuration."
+                            let t = "Load options (" + n + ")"
+                            if (!detailCard.cmp) return t + "  •  neither pane uses this GPU and backend now"
+                            if (detailCard.cmp.missing) return t + "  •  this model is no longer in the " + detailCard.sideName + " pane's models folder"
+                            const where = detailCard.sideName + " pane's " + (detailCard.cmp.shown ? "current" : "saved") + " settings for this model"
+                            return t + (detailCard.changed.length
+                                        ? "  •  " + detailCard.changed.length + " highlighted differ from the " + where + " (hover for the value there)"
+                                        : "  •  same as the " + where)
+                        }
+                    }
+                    QQC2.Button {
+                        text: "Restore these settings"
+                        icon.name: "edit-undo"
+                        enabled: !!detailCard.cmpOpts && !detailCard.cmp.running && (detailCard.r.optList || []).length > 0
+                        onClicked: win.restore(detailCard.r)
+                        QQC2.ToolTip.visible: hovered
+                        QQC2.ToolTip.delay: 300
+                        QQC2.ToolTip.text: !detailCard.cmp ? "Neither pane runs this backend on this hardware now - set that up in Settings first."
+                                         : detailCard.cmp.missing ? "This model is no longer in the models folder."
+                                         : detailCard.cmp.running ? "The " + detailCard.sideName + " pane is running a model - stop it first."
+                                         : "Select this model in the " + detailCard.sideName + " pane with these load options (the port is kept)."
+                    }
+                }
                 Flow {
                     Layout.fillWidth: true
                     spacing: Kirigami.Units.smallSpacing
                     Repeater {
-                        model: Object.keys(detailCard.r.setup || {}).filter(k => { const v = detailCard.r.setup[k]; return v !== "" && v !== null })
+                        model: detailCard.r.optList || []
                         Rectangle {
+                            id: chipBox
+                            readonly property bool diff: detailCard.changed.some(o => o.k === modelData.k)
                             radius: 6
-                            color: Qt.rgba(th.text.r, th.text.g, th.text.b, 0.05)
-                            border.color: th.border
-                            width: chip.implicitWidth + 14; height: chip.implicitHeight + 6
+                            color: diff ? Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.18)
+                                        : Qt.rgba(th.text.r, th.text.g, th.text.b, 0.05)
+                            border.color: diff ? Kirigami.Theme.highlightColor : th.border
+                            width: Math.min(chip.implicitWidth + 14, detailCard.width - Kirigami.Units.gridUnit * 2)
+                            height: chip.implicitHeight + 6
+                            HoverHandler { id: chh }
+                            QQC2.ToolTip.visible: chh.hovered && chipBox.diff
+                            QQC2.ToolTip.delay: 200
+                            QQC2.ToolTip.text: chipBox.diff ? modelData.label + " in the " + detailCard.sideName + " pane: " + (detailCard.cmpOpts[modelData.k] || "(empty)") : ""
                             QQC2.Label {
                                 id: chip
                                 anchors.centerIn: parent
-                                text: modelData + " " + String(detailCard.r.setup[modelData])
-                                color: th.text2
+                                width: Math.min(implicitWidth, parent.width - 14)
+                                elide: Text.ElideRight
+                                textFormat: Text.PlainText
+                                text: modelData.label + " " + modelData.v
+                                color: chipBox.diff ? th.text : th.text2
+                                font.weight: chipBox.diff ? Font.DemiBold : Font.Normal
                                 font.pointSize: win.th.small
                             }
                         }
                     }
+                }
+                QQC2.Label {
+                    visible: win.restoreMsg !== ""
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: win.restoreMsg
+                    color: win.restoreErr ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.positiveTextColor
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -465,6 +562,10 @@ QQC2.ApplicationWindow {
                              : index % 2 ? "transparent" : Qt.rgba(th.text.r, th.text.g, th.text.b, 0.025)
                         radius: 4
                         HoverHandler { id: rh }
+                        QQC2.ToolTip.visible: rh.hovered && (rowRect.r.optList || []).length > 0
+                        QQC2.ToolTip.delay: 500
+                        QQC2.ToolTip.text: win.label(rowRect.r) + "\n" + win.hw(rowRect.r) + (rowRect.r.status === "earlier" ? "  •  earlier settings" : "")
+                                           + win.settingsTip(rowRect.r)
                         TapHandler { onTapped: win.select(rowRect.r) }
                         TapHandler {
                             acceptedButtons: Qt.RightButton
