@@ -615,9 +615,7 @@ impl App {
             }
         }
         for p in 0..2 {
-            if self.has_timer(&super::app::Timer::Save(p)) {
-                self.save_options(p);
-            }
+            self.flush_save(p);
         }
         self.push_event(json!({"type": "quit"}));
     }

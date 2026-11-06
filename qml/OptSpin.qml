@@ -33,6 +33,15 @@ QQC2.SpinBox {
     validator: RegularExpressionValidator { regularExpression: /-?[0-9]*[.]?[0-9]*/ }
     onValueModified: pane.setVar(key, scale === 1 ? String(value) : (value / scale).toFixed(decimals))
 
+    // Typing into the box breaks contentItem.text's binding, so after an edit the box would keep
+    // showing the typed number even when the backend changes the value (switching models restores
+    // that model's saved Context, Fit, …). Whenever the backend value changes, show it again.
+    readonly property int backendValue: parsed()
+    onBackendValueChanged: {
+        spin.value = Qt.binding(function () { return spin.parsed() })
+        spin.contentItem.text = Qt.binding(function () { return spin.displayText })
+    }
+
     // the pane is about to act (Load, Fit, …): a number typed but not yet confirmed counts now
     Connections {
         target: spin.pane

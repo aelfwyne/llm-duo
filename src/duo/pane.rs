@@ -859,8 +859,18 @@ impl App {
         }
     }
 
+    /// Save now if a debounced save is pending. Call before the model or device changes:
+    /// the timer saves under whatever model/device is current when it fires, so an edit made
+    /// just before a switch (e.g. a Context value committed by the switch click) would be lost.
+    pub fn flush_save(&mut self, p: usize) {
+        if self.has_timer(&Timer::Save(p)) {
+            self.save_options(p);
+        }
+    }
+
     // =============================================================== models ==
     pub fn set_device(&mut self, p: usize, dev: Option<Device>) {
+        self.flush_save(p);
         {
             let pane = &mut self.panes[p];
             pane.gpu_name = match &dev {
@@ -874,6 +884,7 @@ impl App {
     }
 
     pub fn set_models(&mut self, p: usize, models: Vec<String>) {
+        self.flush_save(p);
         let cur = self.panes[p].model_var.clone();
         self.panes[p].models = models.clone();
         if !models.contains(&cur) {
@@ -932,6 +943,7 @@ impl App {
         if self.panes[p].proc.is_some() || !self.panes[p].models.iter().any(|m| m == rel) {
             return;
         }
+        self.flush_save(p);
         self.panes[p].model_var = rel.to_string();
         self.on_model_selected(p);
     }

@@ -1397,9 +1397,7 @@ impl App {
         if new == self.panes[p].backend || !BACKENDS.contains(&new) || self.panes[p].proc.is_some() {
             return;
         }
-        if self.has_timer(&Timer::Save(p)) {
-            self.save_options(p);
-        }
+        self.flush_save(p);
         let rel = self.panes[p].model_var.clone();
         if !rel.is_empty() {
             let key = self.panes[p].last_key();
