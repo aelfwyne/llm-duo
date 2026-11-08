@@ -57,13 +57,50 @@ pub fn detect_devices(server_bin: &str) -> (Vec<Device>, String) {
     (attach_sysfs(devices), err)
 }
 
-/// Match each device to a /sys/class/drm card (by VRAM size) for live stats.
-pub fn attach_sysfs(mut devices: Vec<Device>) -> Vec<Device> {
+/// DRM render minors of the GPUs HIP can see, in HIP device order (HIP numbers its devices in
+/// KFD topology order, which is not the /sys/class/drm cardN order). None if unknown.
+fn hip_render_minors(kfd: &Path) -> Option<Vec<i64>> {
+    let mut nodes: Vec<(u64, i64)> = vec![];
+    for e in std::fs::read_dir(kfd.join("nodes")).ok()?.filter_map(|e| e.ok()) {
+        let Ok(id) = e.file_name().to_string_lossy().parse::<u64>() else { continue };
+        let Ok(props) = std::fs::read_to_string(e.path().join("properties")) else { continue };
+        let prop = |k: &str| {
+            props.lines().find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix(' ')).and_then(|v| v.trim().parse::<i64>().ok()))
+        };
+        // CPU nodes have no SIMDs
+        if prop("simd_count").unwrap_or(0) > 0 {
+            nodes.push((id, prop("drm_render_minor")?));
+        }
+    }
+    nodes.sort();
+    let mut minors: Vec<i64> = nodes.into_iter().map(|n| n.1).collect();
+    // ROCR_VISIBLE_DEVICES filters the agents, then HIP_VISIBLE_DEVICES indexes what is left.
+    // Only plain index lists are understood; UUIDs etc. fall back to matching by VRAM size.
+    for var in ["ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"] {
+        let Ok(v) = std::env::var(var) else { continue };
+        if v.trim().is_empty() {
+            continue;
+        }
+        let idx: Vec<usize> = v.split(',').map(|s| s.trim().parse::<usize>().ok()).collect::<Option<_>>()?;
+        minors = idx.iter().map(|&i| minors.get(i).copied()).collect::<Option<_>>()?;
+    }
+    Some(minors)
+}
+
+/// Match each device to a /sys/class/drm card for live stats: ROCm devices through the KFD
+/// topology (exact, also for identical cards), the rest by VRAM size.
+pub fn attach_sysfs(devices: Vec<Device>) -> Vec<Device> {
+    // LLM_DUO_DRM_DIR / LLM_DUO_KFD_DIR: stand-ins for /sys/class/drm and /sys/class/kfd/kfd
+    // (testing without the hardware)
+    let drm = std::env::var("LLM_DUO_DRM_DIR").unwrap_or_else(|_| "/sys/class/drm".into());
+    let kfd = std::env::var("LLM_DUO_KFD_DIR").unwrap_or_else(|_| "/sys/class/kfd/kfd".into());
+    attach_sysfs_in(devices, Path::new(&drm), Path::new(&kfd))
+}
+
+fn attach_sysfs_in(mut devices: Vec<Device>, drm: &Path, kfd: &Path) -> Vec<Device> {
     let mut cards: Vec<(PathBuf, f64)> = Vec::new();
     let card_re = Regex::new(r"^card\d+$").unwrap();
-    // LLM_DUO_DRM_DIR: a stand-in for /sys/class/drm (testing without the hardware)
-    let drm = std::env::var("LLM_DUO_DRM_DIR").unwrap_or_else(|_| "/sys/class/drm".into());
-    if let Ok(rd) = std::fs::read_dir(&drm) {
+    if let Ok(rd) = std::fs::read_dir(drm) {
         let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         entries.sort();
         for d in entries {
@@ -78,7 +115,21 @@ pub fn attach_sysfs(mut devices: Vec<Device>) -> Vec<Device> {
         }
     }
     let mut used = vec![false; cards.len()];
-    let mut idx: Vec<usize> = (0..devices.len()).collect();
+    let canon: Vec<Option<PathBuf>> = cards.iter().map(|c| std::fs::canonicalize(&c.0).ok()).collect();
+    if let Some(minors) = hip_render_minors(kfd) {
+        for d in devices.iter_mut() {
+            if !matches!(d.backend.to_lowercase().as_str(), "rocm" | "hip") || d.index < 0 {
+                continue;
+            }
+            let Some(minor) = minors.get(d.index as usize) else { continue };
+            let Ok(p) = std::fs::canonicalize(drm.join(format!("renderD{minor}")).join("device")) else { continue };
+            if let Some(i) = (0..cards.len()).find(|&i| !used[i] && canon[i].as_ref() == Some(&p)) {
+                used[i] = true;
+                d.sysfs = Some(cards[i].0.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut idx: Vec<usize> = (0..devices.len()).filter(|&i| devices[i].sysfs.is_none()).collect();
     idx.sort_by_key(|&i| -devices[i].total_mib);
     for di in idx {
         let mut best: Option<(usize, f64)> = None;
@@ -129,4 +180,51 @@ pub fn device_env(dev: &Device) -> Vec<(String, String)> {
 
 pub fn dev_label(d: &Device, decimals: usize) -> String {
     format!("{}: {} ({:.*} GiB)", d.id, d.name, decimals, d.total_mib as f64 / 1024.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(i: i64) -> Device {
+        Device {
+            backend: "ROCm".into(),
+            index: i,
+            id: format!("ROCm{i}"),
+            name: "AMD Radeon AI PRO R9700".into(),
+            total_mib: 32624,
+            sysfs: None,
+        }
+    }
+
+    #[test]
+    fn identical_cards_follow_hip_order_not_card_numbers() {
+        // card0 = PCI 06:00.0 (renderD129), card1 = PCI 03:00.0 (renderD128); HIP device 0 is
+        // the first KFD GPU node, renderD128 -> card1
+        let root = std::env::temp_dir().join(format!("llmduo-devs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (drm, kfd, pci) = (root.join("drm"), root.join("kfd"), root.join("pci"));
+        for (card, bdf, minor) in [("card0", "0000:06:00.0", 129), ("card1", "0000:03:00.0", 128)] {
+            let d = pci.join(bdf);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("mem_info_vram_total"), "34208743424").unwrap();
+            std::fs::create_dir_all(drm.join(card)).unwrap();
+            std::os::unix::fs::symlink(&d, drm.join(card).join("device")).unwrap();
+            std::fs::create_dir_all(drm.join(format!("renderD{minor}"))).unwrap();
+            std::os::unix::fs::symlink(&d, drm.join(format!("renderD{minor}")).join("device")).unwrap();
+        }
+        for (n, simd, minor) in [(0, 0, 0), (1, 128, 128), (2, 128, 129)] {
+            let d = kfd.join("nodes").join(n.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("properties"), format!("cpu_cores_count 0\nsimd_count {simd}\ndrm_render_minor {minor}\n")).unwrap();
+        }
+        let out = attach_sysfs_in(vec![dev(0), dev(1)], &drm, &kfd);
+        let end = |d: &Device| PathBuf::from(d.sysfs.clone().unwrap()).parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(end(&out[0]), "card1");
+        assert_eq!(end(&out[1]), "card0");
+        // without KFD topology: falls back to VRAM size (both cards still get one)
+        let out = attach_sysfs_in(vec![dev(0), dev(1)], &drm, &root.join("none"));
+        assert!(out.iter().all(|d| d.sysfs.is_some()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
