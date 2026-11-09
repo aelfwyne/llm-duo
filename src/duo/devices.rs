@@ -61,7 +61,7 @@ pub fn detect_devices(server_bin: &str) -> (Vec<Device>, String) {
 /// KFD topology order, which is not the /sys/class/drm cardN order). None if unknown.
 fn hip_render_minors(kfd: &Path) -> Option<Vec<i64>> {
     let mut nodes: Vec<(u64, i64)> = vec![];
-    for e in std::fs::read_dir(kfd.join("nodes")).ok()?.filter_map(|e| e.ok()) {
+    for e in std::fs::read_dir(kfd.join("topology").join("nodes")).ok()?.filter_map(|e| e.ok()) {
         let Ok(id) = e.file_name().to_string_lossy().parse::<u64>() else { continue };
         let Ok(props) = std::fs::read_to_string(e.path().join("properties")) else { continue };
         let prop = |k: &str| {
@@ -90,7 +90,8 @@ fn hip_render_minors(kfd: &Path) -> Option<Vec<i64>> {
 /// Match each device to a /sys/class/drm card for live stats: ROCm devices through the KFD
 /// topology (exact, also for identical cards), the rest by VRAM size.
 pub fn attach_sysfs(devices: Vec<Device>) -> Vec<Device> {
-    // LLM_DUO_DRM_DIR / LLM_DUO_KFD_DIR: stand-ins for /sys/class/drm and /sys/class/kfd/kfd
+    // LLM_DUO_DRM_DIR / LLM_DUO_KFD_DIR: stand-ins for /sys/class/drm and /sys/class/kfd/kfd (whose
+    // GPU nodes are under topology/nodes)
     // (testing without the hardware)
     let drm = std::env::var("LLM_DUO_DRM_DIR").unwrap_or_else(|_| "/sys/class/drm".into());
     let kfd = std::env::var("LLM_DUO_KFD_DIR").unwrap_or_else(|_| "/sys/class/kfd/kfd".into());
@@ -214,7 +215,7 @@ mod tests {
             std::os::unix::fs::symlink(&d, drm.join(format!("renderD{minor}")).join("device")).unwrap();
         }
         for (n, simd, minor) in [(0, 0, 0), (1, 128, 128), (2, 128, 129)] {
-            let d = kfd.join("nodes").join(n.to_string());
+            let d = kfd.join("topology").join("nodes").join(n.to_string());
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("properties"), format!("cpu_cores_count 0\nsimd_count {simd}\ndrm_render_minor {minor}\n")).unwrap();
         }
