@@ -290,6 +290,14 @@ QQC2.Pane {
                 onClicked: pv.act("openWeb")
                 HelpTip { text: pv.h(pd.isRad ? "r_web" : pd.isVllm ? "v_web" : "web"); shown: webBtn.hovered }
             }
+            QQC2.Button {
+                id: benchBtn
+                text: pd.benchHere ? "BetterBench… (running)" : "BetterBench…"
+                icon.name: "office-chart-bar"
+                enabled: !!pd.webEnabled || !!pd.benchHere
+                onClicked: pv.act("bench")
+                HelpTip { text: pv.h("bench"); shown: benchBtn.hovered }
+            }
             Item { Layout.fillWidth: true }
             QQC2.Button {
                 id: copyBtn

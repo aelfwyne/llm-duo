@@ -8,6 +8,7 @@ fn main() {
         "qml/PaneView.qml",
         "qml/SettingsWindow.qml",
         "qml/QuantizeWindow.qml",
+        "qml/BenchWindow.qml",
         "qml/RadConvertWindow.qml",
         "qml/ReportWindow.qml",
         "qml/PathField.qml",

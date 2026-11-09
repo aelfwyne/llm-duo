@@ -40,6 +40,7 @@ pub enum Pending {
     LoadAnyway(usize),
     ConvDeleteUnfinished(PathBuf),
     ConvCloseRunning,
+    BenchCloseRunning,
 }
 
 pub struct App {
@@ -70,6 +71,7 @@ pub struct App {
     pub quant: Quant,
     quant_busy: bool,
     pub conv: super::rad_convert::Conv,
+    pub bench: super::bench::Bench,
     pub started: bool,
     detecting: bool,
     /// dashboard: GPU sensor samples and limits per device id
@@ -116,6 +118,7 @@ impl App {
             quant: Quant::new(),
             quant_busy: false,
             conv: super::rad_convert::Conv::new(),
+            bench: super::bench::Bench::new(),
             started: false,
             detecting: false,
             gpu_hist: HashMap::new(),
@@ -569,6 +572,7 @@ impl App {
         }
         self.quant_poll();
         self.conv_poll();
+        self.bench_poll();
         self.run_timers();
     }
 
@@ -593,8 +597,14 @@ impl App {
     }
 
     fn close_stage2(&mut self) {
-        if self.quant.proc.is_some() || self.conv.proc.is_some() {
-            let what = if self.quant.proc.is_some() { "An FP8 conversion" } else { "A Radiance conversion" };
+        if self.quant.proc.is_some() || self.conv.proc.is_some() || self.bench.busy() {
+            let what = if self.quant.proc.is_some() {
+                "An FP8 conversion"
+            } else if self.conv.proc.is_some() {
+                "A Radiance conversion"
+            } else {
+                "A BetterBench run"
+            };
             self.ask(&format!("{what} is still running. Stop it and quit?"), "yesno", Pending::QuitQuant);
             return;
         }
@@ -608,6 +618,7 @@ impl App {
         if self.conv.proc.is_some() {
             self.conv_stop();
         }
+        self.bench_stop();
         self.r_probe_kill_all();
         for p in 0..2 {
             if self.panes[p].proc.is_some() {
@@ -671,6 +682,14 @@ impl App {
                     self.quant.visible = false;
                 }
                 "no" => self.quant.visible = false,
+                _ => {}
+            },
+            Pending::BenchCloseRunning => match ans {
+                "yes" => {
+                    self.bench_stop();
+                    self.bench.visible = false;
+                }
+                "no" => self.bench.visible = false,
                 _ => {}
             },
             Pending::QuitModels => {
@@ -859,6 +878,7 @@ impl App {
             "dualModes": modes, "dualFirstValues": first_vals,
             "dualManualEnabled": manual && !running, "dualInfo": pane.dual_info,
             "webEnabled": pane.web_enabled,
+            "benchHere": self.bench_here(p),
             "webLabel": if pane.is_vllm() {
                 "API docs"
             } else if pane.is_kobold() {
@@ -894,6 +914,7 @@ impl App {
             "panes": [left, right],
             "quant": self.quant_ui(),
             "convert": self.conv_ui(),
+            "bench": self.bench_ui(),
             "lists": {
                 "kvTypes": KV_TYPES, "fa": ["on", "auto", "off"], "kbuilds": KOBOLD_BUILDS,
                 "vKvTypes": VLLM_KV_TYPES, "vDtypes": VLLM_DTYPES, "vQuant": VLLM_ONLINE_QUANT_KEYS,
@@ -907,7 +928,7 @@ impl App {
     }
 
     // =========================================================== dispatch ==
-    /// Single entry point for the UI: `target` is "app", "left", "right" or "quant".
+    /// Single entry point for the UI: `target` is "app", "left", "right", "quant", "convert", "bench" or "dash".
     pub fn call(&mut self, target: &str, action: &str, arg: &Value) -> Value {
         let s = |k: &str| arg.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
         let p = match target {
@@ -930,6 +951,7 @@ impl App {
                 "load" => self.load(p),
                 "stop" => self.stop(p, false, true),
                 "openWeb" => self.open_web(p),
+                "bench" => self.bench_show(p),
                 "copyCmd" => self.copy_cmd(p),
                 "copyLog" => self.copy_log(p),
                 "saveLog" => self.save_log(p),
@@ -946,6 +968,18 @@ impl App {
                 "restore" => self.dash_restore(arg),
                 _ => Value::Null,
             };
+        }
+        if target == "bench" {
+            match action {
+                "start" => self.bench_start(arg),
+                "stop" => self.bench_stop(),
+                "hide" => self.bench.visible = false,
+                "close" => self.bench_close(),
+                "openReport" => self.bench_open_report(),
+                "openRuns" => self.bench_open_runs(),
+                _ => {}
+            }
+            return Value::Null;
         }
         if target == "convert" {
             let v = arg.get("value").map(py_str).unwrap_or_default();

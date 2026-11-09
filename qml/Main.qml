@@ -60,11 +60,13 @@ Kirigami.ApplicationWindow {
         case "log":
             if (e.side === "quant") quantWindow.appendLog(e.text)
             else if (e.side === "convert") convertWindow.appendLog(e.text)
+            else if (e.side === "bench") benchWindow.appendLog(e.text)
             else (e.side === "left" ? leftPane : rightPane).appendLog(e.text)
             break
         case "logClear":
             if (e.side === "quant") quantWindow.clearLog()
             else if (e.side === "convert") convertWindow.clearLog()
+            else if (e.side === "bench") benchWindow.clearLog()
             else (e.side === "left" ? leftPane : rightPane).clearLog()
             break
         case "msg":
@@ -212,6 +214,12 @@ Kirigami.ApplicationWindow {
         id: quantWindow
         help: root.help
         q: root.ui.quant || ({})
+    }
+    BenchWindow {
+        id: benchWindow
+        help: root.help
+        b: root.ui.bench || ({})
+        onVisibleChanged: if (visible) { raise(); requestActivate() }
     }
     RadConvertWindow {
         id: convertWindow

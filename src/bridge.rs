@@ -34,7 +34,7 @@ pub mod qobject {
         #[qinvokable]
         fn tick(self: Pin<&mut Backend>);
 
-        /// `target`: "app", "left", "right" or "quant"; `arg`: JSON. Returns JSON.
+        /// `target`: "app", "left", "right", "quant", "convert", "bench" or "dash"; `arg`: JSON. Returns JSON.
         #[qinvokable]
         fn call(self: Pin<&mut Backend>, target: &QString, action: &QString, arg: &QString) -> QString;
 

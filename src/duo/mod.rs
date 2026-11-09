@@ -2,6 +2,7 @@
 #![allow(dead_code)] // some fields mirror the Python data structures for completeness
 
 pub mod app;
+pub mod bench;
 pub mod consts;
 pub mod dash;
 pub mod devices;
