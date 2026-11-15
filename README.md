@@ -178,9 +178,9 @@ longest input. A model with no KV cache has nothing for Fit to measure, and Fit 
 `--api-key-env` (`server.api-key-env` in 2.0), so it doesn't show in `ps` or in the YAML file.
 Older builds get `--api-key` on the command line.
 
-**Gemma 4 31B with a DFlash2 drafter** fails its first request in Radiance 2.0 with the i8 KV
-cache (its draft trees can't move i8 rows). LLM Duo warns before Load and changes nothing; it runs
-with the bf16 cache, or with Spec tokens 0.
+**Gemma 4 31B with a DFlash2 drafter** fails its first request in Radiance 2.0.x with the i8 KV
+cache (its draft trees can't move i8 rows). Radiance 2.1.0 fixes this (#454). On 2.0.x LLM Duo
+warns before Load and changes nothing; there it runs with the bf16 cache, or with Spec tokens 0.
 
 **Dual GPU mode** runs `--tp 2` (tensor parallel), because Radiance has no layer split. The KV
 pool is sized to the tighter card, so an R9700 + 9070 XT pair usually holds less context than the
@@ -237,6 +237,14 @@ cargo test     # needs the Qt dev packages too, since the crate links Qt
 ```
 
 ## Changelog
+
+### 1.1.1
+
+Changed:
+
+- The warning before Load for Gemma 4 + DFlash2 with the i8 KV cache only appears on Radiance
+  2.0.x. Radiance 2.1.0 fixed the crash (#454); LLM Duo recognises 2.1 by the `stuck-exit`
+  setting in `radiance --help`. The warning on 2.0.x now points at `~/radiance/update.sh`.
 
 ### 1.1.0
 

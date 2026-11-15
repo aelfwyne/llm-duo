@@ -48,9 +48,9 @@ This container's DFlash2 drafter is verified as a draft tree (Gemma 4 + DFlash2)
 tree code cannot move rows of the i8 KV cache (516-byte rows; it needs a multiple of 16). It loads and \
 reports ready, then stops with \"KV group N's cache (i8, 516-byte rows) is not one a tree's acceptance \
 can move\" and refuses every request after it.\n\n\
-Radiance 1.17 served this with its fp8 cache (512-byte rows); 2.0 replaced fp8 with i8 and serves fp8 \
-for GLM-5.3 only. Settings that run today: Spec tokens 0 (i8 kept, no drafter), or KV cache bf16 \
-(drafter kept, about half the context). LLM Duo changes neither for you.";
+Radiance 2.1.0 fixes this (#454): update Radiance (~/radiance/update.sh). Until then, settings that \
+run: Spec tokens 0 (i8 kept, no drafter), or KV cache bf16 (drafter kept, about half the context). \
+LLM Duo changes neither for you.";
 
 fn list_or(v: String, list: &[&str], d: &str) -> String {
     if list.contains(&v.as_str()) { v } else { d.to_string() }
@@ -102,6 +102,10 @@ impl App {
     pub fn r_tree_blocks_i8(&self, p: usize, o: &Opts) -> bool {
         let tree = self.panes[p].info_r().map(|i| i.tree_drafter).unwrap_or(false);
         if !tree || gs(o, "r_kv", "i8") != "i8" {
+            return false;
+        }
+        // fixed in Radiance 2.1.0 (#454)
+        if tree_i8_fixed(&expanduser(&gs(self.settings.g(), "radiance_bin", "radiance"))) {
             return false;
         }
         let extra = shlex_split(&gs(o, "extra", "")).unwrap_or_default();

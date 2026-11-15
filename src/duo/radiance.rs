@@ -69,6 +69,13 @@ pub fn uses_config(bin: &Path) -> bool {
     binary_has_flag(bin, "--config")
 }
 
+/// Radiance 2.1.0 fixed draft trees with the i8 KV cache (#454: Gemma 4 + DFlash2 stopped on its
+/// first request). The binary states no version without serving, so this reads its `--help`: 2.1.0
+/// added `scheduler.stuck-exit` in the same release.
+pub fn tree_i8_fixed(bin: &Path) -> bool {
+    binary_has_flag(bin, "stuck-exit")
+}
+
 /// Where a pane's generated Radiance configuration is written (`tag`: "left", "left-plan", …).
 pub fn config_path(tag: &str) -> PathBuf {
     dirs().data.join("radiance").join(format!("{tag}.yaml"))
@@ -1254,6 +1261,9 @@ mod tests {
     fn help_flags() {
         let h = "  --spec-ngram K   drafts\n  --api-key KEY  the key\n  --spec-ngram-min N  shortest";
         assert!(help_has_flag(h, "--spec-ngram"));
+        // 2.1.0's help lists scheduler.stuck-exit (the #454 fix is in the same release)
+        assert!(help_has_flag("scheduler:\n  stuck-exit: DURATION   a device stuck this long", "stuck-exit"));
+        assert!(!help_has_flag("scheduler:\n  load-timeout: DURATION", "stuck-exit"));
         assert!(!help_has_flag(h, "--api-key-env"), "--api-key must not read as --api-key-env");
         assert!(!help_has_flag(h, "--spec"));
         use std::os::unix::fs::PermissionsExt;
