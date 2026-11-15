@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod bench;
+pub mod calib;
 pub mod consts;
 pub mod dash;
 pub mod devices;
@@ -16,6 +17,7 @@ pub mod pane_k;
 pub mod pane_run;
 pub mod pane_r;
 pub mod pane_v;
+pub mod prefix;
 pub mod proc;
 pub mod quantize;
 pub mod rad_convert;

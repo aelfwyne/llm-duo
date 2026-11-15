@@ -26,6 +26,37 @@ QQC2.Pane {
         Backend.call(side, action, JSON.stringify(arg || {}))
     }
     function h(key) { return help[key] || "" }
+
+    // a prefix-cache size box and its Calc button (llama.cpp --cache-ram, vLLM
+    // --kv-offloading-size, Radiance --prefix-cache-mib): the dialog works out the size
+    component PrefixField: RowLayout {
+        id: pf
+        property string key
+        property string help: ""
+        property int from: 0
+        property int to: 1048576
+        property int stepSize: 1024
+        property int scale: 1
+        property int decimals: 0
+        spacing: 2
+        Layout.fillWidth: true
+        OptSpin {
+            pane: pv; key: pf.key; from: pf.from; to: pf.to; stepSize: pf.stepSize
+            scale: pf.scale; decimals: pf.decimals; help: pf.help; enabled: pf.enabled
+        }
+        QQC2.Button {
+            id: calcBtn
+            text: "Calc"
+            enabled: pf.enabled
+            Layout.minimumWidth: implicitWidth   // never squeezed away by the spin box
+            Layout.fillWidth: false
+            onClicked: { pv.flushEdits(); prefixDlg.show() }
+            HelpTip {
+                text: "Work out a prefix cache size for this model, KV cache type and Context:\nhow many finished conversations to keep in system RAM, and how long they get."
+                shown: calcBtn.hovered
+            }
+        }
+    }
     function tc(hex) {
         switch (hex) {
         case "#2e9e44": return Kirigami.Theme.positiveTextColor
@@ -485,9 +516,12 @@ QQC2.Pane {
             OptLabel { text: "mmproj"; help: pv.h("mmproj") }
             OptCombo {
                 pane: pv; key: "mmproj"; values: pd.mmprojValues || []; help: pv.h("mmproj")
-                Layout.columnSpan: pv.wide ? 7 : 3
+                Layout.columnSpan: pv.wide ? 5 : 3
                 Layout.preferredWidth: Kirigami.Units.gridUnit * 12
             }
+            OptLabel { text: "Prefix cache"; help: pv.h("cache_ram") }
+            PrefixField { key: "cache_ram"; from: -1; help: pv.h("cache_ram"); enabled: !pd.isKobold }
+            Item { visible: !pv.wide; Layout.columnSpan: 2; Layout.preferredHeight: 1 }
 
             OptLabel { text: "MTP drafter"; help: pv.h("mtp") }
             OptCombo {
@@ -564,7 +598,7 @@ QQC2.Pane {
             OptLabel { text: "Reasoning"; help: pv.h("reasoning") }
             QQC2.ComboBox {
                 id: reasonBox
-                Layout.columnSpan: pv.wide ? 5 : 1
+                Layout.columnSpan: pv.wide ? 3 : 1
                 Layout.fillWidth: true
                 Layout.minimumWidth: Kirigami.Units.gridUnit * 4
                 Layout.preferredWidth: Kirigami.Units.gridUnit * 6
@@ -586,6 +620,9 @@ QQC2.Pane {
                 }
                 HelpTip { text: pv.h("reasoning"); shown: reasonBox.hovered && !reasonBox.popup.visible }
             }
+            OptLabel { text: "Prefix cache"; help: pv.h("kv_offload") }
+            PrefixField { key: "kv_offload"; to: 10240; stepSize: 10; scale: 10; decimals: 1; help: pv.h("kv_offload") }
+            Item { visible: !pv.wide; Layout.columnSpan: 2; Layout.preferredHeight: 1 }
 
             OptLabel { text: "MTP"; help: pv.h("v_mtp") }
             OptCombo {
@@ -673,7 +710,7 @@ QQC2.Pane {
             OptSpin { pane: pv; key: "r_host_pool"; from: 0; to: 1048576; stepSize: 1024; help: pv.h("r_host_pool") }
 
             OptLabel { text: "Prefix cache"; help: pv.h("r_prefix_mib") }
-            OptSpin { pane: pv; key: "r_prefix_mib"; from: 0; to: 1048576; stepSize: 1024; help: pv.h("r_prefix_mib") }
+            PrefixField { key: "r_prefix_mib"; help: pv.h("r_prefix_mib") }
             OptLabel { text: "Prefill span"; help: pv.h("r_prefill_span") }
             OptSpin { pane: pv; key: "r_prefill_span"; from: 1; to: 16; help: pv.h("r_prefill_span") }
             OptLabel { text: "Reasoning"; help: pv.h("r_reasoning") }
@@ -713,6 +750,159 @@ QQC2.Pane {
             OptText {
                 pane: pv; key: "extra"; help: pv.h("r_extra")
                 Layout.columnSpan: rg.w8 ? 7 : 3; Layout.fillWidth: true
+            }
+        }
+    }
+
+    // ============================================== prefix-cache calculator (every backend)
+    Kirigami.Dialog {
+        id: prefixDlg
+        property var d: ({})
+        readonly property bool gib: d.unit === "GiB"
+        // one conversation of lenSpin tokens: full-attention layers, sliding-window layers up to
+        // their window, per-sequence state; rounded up a MiB like Radiance's own figure
+        readonly property real perConvMib: d.ok
+            ? Math.ceil((d.bpt * lenSpin.value + d.swaBpt * Math.min(lenSpin.value, d.window || 0) + d.fixed) / 1048576) + 1 : 0
+        readonly property int wantMib: d.ok ? Math.ceil(convSpin.value * perConvMib / 64) * 64 : 0
+        readonly property bool overCap: d.ok && d.capMib > 0 && wantMib > d.capMib
+        readonly property bool overAvail: d.ok && d.memAvailMib > 0 && wantMib > d.memAvailMib - 4096
+        readonly property int applyMib: overCap ? d.capMib : wantMib
+        // the value as the box stores it: MiB, or GiB in half-GiB steps (rounded up / down at the cap)
+        function asValue(m) {
+            if (!gib) return String(m)
+            const g = overCap ? Math.floor(m / 512) / 2 : Math.ceil(m / 512) / 2
+            return g.toFixed(1)
+        }
+        function show() {
+            d = JSON.parse(Backend.call(pv.side, "prefixCalc", "{}") || "{}")
+            const ctx = d.ctx > 0 ? d.ctx : 32768
+            lenSpin.to = Math.max(ctx, 1024)
+            lenSpin.value = ctx
+            convSpin.value = Math.max(1, Math.min(8, d.seqs || 1))
+            open()
+        }
+        function mib(x) { return x >= 1024 ? (x / 1024).toFixed(1) + " GiB" : Math.round(x) + " MiB" }
+        function cur() {
+            if (d.current === undefined) return ""
+            if (d.unlimited && d.current < 0) return "now no limit"
+            if (d.current <= 0) return "now off"
+            return "now " + d.current + " " + (d.unit || "MiB")
+        }
+
+        title: "Prefix cache calculator" + (d.flag ? "  (" + d.flag + ")" : "")
+        padding: Kirigami.Units.largeSpacing
+        preferredWidth: Kirigami.Units.gridUnit * 36
+        customFooterActions: [
+            Kirigami.Action {
+                text: "Apply " + prefixDlg.asValue(prefixDlg.applyMib) + " " + (prefixDlg.d.unit || "MiB")
+                      + (prefixDlg.overCap ? " (the most there is room for)" : "")
+                icon.name: "dialog-ok-apply"
+                enabled: !!prefixDlg.d.ok && prefixDlg.applyMib > 0
+                onTriggered: {
+                    pv.setVar(prefixDlg.d.key, prefixDlg.asValue(prefixDlg.applyMib))
+                    prefixDlg.close()
+                }
+            },
+            Kirigami.Action {
+                text: "No limit (-1)"
+                icon.name: "kt-speed-limits"
+                visible: !!prefixDlg.d.unlimited
+                enabled: !!prefixDlg.d.key
+                onTriggered: { pv.setVar(prefixDlg.d.key, "-1"); prefixDlg.close() }
+            },
+            Kirigami.Action {
+                text: "Turn off (0)"
+                icon.name: "edit-clear"
+                enabled: !!prefixDlg.d.key
+                onTriggered: { pv.setVar(prefixDlg.d.key, "0"); prefixDlg.close() }
+            },
+            Kirigami.Action {
+                text: "Cancel"
+                icon.name: "dialog-cancel"
+                onTriggered: prefixDlg.close()
+            }
+        ]
+
+        ColumnLayout {
+            spacing: Kirigami.Units.largeSpacing
+
+            QQC2.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: prefixDlg.d.what || ""
+            }
+            GridLayout {
+                columns: 2
+                columnSpacing: Kirigami.Units.largeSpacing
+                rowSpacing: Kirigami.Units.smallSpacing
+                Layout.fillWidth: true
+
+                QQC2.Label { text: "KV cache type" }
+                QQC2.Label { text: (prefixDlg.d.kv || "?") + (prefixDlg.d.ranks > 1 ? "  •  " + prefixDlg.d.ranks + " cards (the size covers all of them)" : "") }
+                QQC2.Label { text: "Host cost a token" }
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: !prefixDlg.d.ok ? "unknown"
+                          : ((prefixDlg.d.bpt + prefixDlg.d.swaBpt * (prefixDlg.d.window > 0 ? Math.min(1, prefixDlg.d.window / Math.max(1, lenSpin.value)) : 0)) / 1024).toFixed(1)
+                            + " KiB on average at this length" + (prefixDlg.d.exact ? " (exact)" : " (estimate)")
+                    color: prefixDlg.d.ok ? Kirigami.Theme.textColor : Kirigami.Theme.negativeTextColor
+                }
+                Item { width: 1; height: 1 }
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: prefixDlg.d.source || ""
+                    font: Kirigami.Theme.smallFont
+                    color: Kirigami.Theme.disabledTextColor
+                }
+                QQC2.Label { text: "Conversations to keep" }
+                QQC2.SpinBox { id: convSpin; from: 1; to: 256; editable: true; Layout.preferredWidth: Kirigami.Units.gridUnit * 8 }
+                QQC2.Label { text: "Tokens each" }
+                RowLayout {
+                    QQC2.SpinBox { id: lenSpin; from: 256; to: 1048576; stepSize: 1024; editable: true; Layout.preferredWidth: Kirigami.Units.gridUnit * 8 }
+                    QQC2.Label {
+                        text: "a full one is " + (prefixDlg.d.ctx || 0).toLocaleString(Qt.locale(), "f", 0)
+                        color: Kirigami.Theme.disabledTextColor
+                    }
+                }
+            }
+            Kirigami.Separator { Layout.fillWidth: true }
+            QQC2.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                visible: !!prefixDlg.d.ok
+                font.bold: true
+                text: "Prefix cache " + prefixDlg.mib(prefixDlg.wantMib) + "  (" + prefixDlg.mib(prefixDlg.perConvMib) + " a conversation)  •  " + prefixDlg.cur()
+            }
+            QQC2.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                font: Kirigami.Theme.smallFont
+                text: "System RAM " + prefixDlg.mib(prefixDlg.d.memTotalMib || 0) + ", " + prefixDlg.mib(prefixDlg.d.memAvailMib || 0) + " available"
+                      + (prefixDlg.d.otherPinnedMib > 0 ? "  •  " + prefixDlg.d.otherPinnedName + " already pins " + prefixDlg.mib(prefixDlg.d.otherPinnedMib) : "")
+                      + "  •  room for ≈ " + prefixDlg.mib(prefixDlg.d.capMib || 0) + (prefixDlg.d.pinned ? " of pinned memory" : "")
+            }
+            QQC2.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                visible: prefixDlg.overCap || prefixDlg.overAvail
+                color: prefixDlg.overCap ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.neutralTextColor
+                text: prefixDlg.overCap
+                      ? (prefixDlg.d.pinned
+                         ? "More than the driver can pin: the backend would fail to allocate it or start without it. Keep fewer or shorter conversations, or apply the limit."
+                         : "More than this machine's RAM can hold next to everything else. Keep fewer or shorter conversations, or apply the limit.")
+                      : (prefixDlg.d.pinned
+                         ? "Leaves less than 4 GiB of RAM free: pinned memory cannot be swapped, so the desktop and other programs get squeezed."
+                         : "More than is free right now: the cache only grows as it fills, but once full it would push other programs into swap.")
+            }
+            QQC2.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                visible: !!prefixDlg.d.running
+                font: Kirigami.Theme.smallFont
+                color: Kirigami.Theme.disabledTextColor
+                text: "The model is running: a new size takes effect on the next Load."
             }
         }
     }

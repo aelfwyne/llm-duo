@@ -153,6 +153,11 @@ impl App {
         if gi(&s, "threads", 0) > 0 {
             cmd.extend(["-t".into(), gi(&s, "threads", 0).to_string()]);
         }
+        // the host-RAM prompt cache: llama-server's own default is 8192 MiB
+        let cram = gi(&s, "cache_ram", LLAMA_CACHE_RAM_DEFAULT);
+        if cram != LLAMA_CACHE_RAM_DEFAULT && self.supports(p, "--cache-ram") {
+            cmd.extend(["--cache-ram".into(), cram.to_string()]);
+        }
         let ncm = gi(&s, "n_cpu_moe", 0);
         if let Some(cs) = dual_plan.as_ref().and_then(|pl| pl.cpu_set.clone()).filter(|c| !c.is_empty()) {
             let layers = cs.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("|");
@@ -287,7 +292,25 @@ impl App {
                 return;
             }
         };
-        let env = self.run_env(p).iter().map(|(k, v)| format!("{k}={}", shlex_quote(v))).collect::<Vec<_>>().join(" ");
+        let env_extra = self.run_env(p);
+        let cmd = if self.panes[p].is_rad() {
+            // 2.0+: write the configuration file the copied line starts radiance on
+            let mut full: Vec<(String, String)> = std::env::vars().collect();
+            for (k, v) in &env_extra {
+                full.retain(|e| &e.0 != k);
+                full.push((k.clone(), v.clone()));
+            }
+            match self.r_launch_cmd(&cmd, &full, &format!("{}-copy", self.panes[p].side)) {
+                Ok((c, _)) => c,
+                Err(e) => {
+                    self.msg("error", &format!("Could not write Radiance's configuration:\n{e}"));
+                    return;
+                }
+            }
+        } else {
+            cmd
+        };
+        let env = env_extra.iter().map(|(k, v)| format!("{k}={}", shlex_quote(v))).collect::<Vec<_>>().join(" ");
         let prefix = if self.panes[p].is_vllm() { self.v_copy_prefix() } else { String::new() };
         let text = prefix + &if env.is_empty() { String::new() } else { format!("{env} ") } + &shlex_join(&cmd);
         self.clipboard(&text);
@@ -371,6 +394,21 @@ impl App {
                 return;
             }
         };
+        // Radiance 2.0 loads a Gemma 4 + DFlash2 container with the i8 cache and then stops on the
+        // first request: say so before starting it, and change nothing
+        if self.panes[p].is_rad() && !self.panes[p].tree_i8_confirmed && self.r_tree_blocks_i8(p, &s) {
+            if self.panes[p].autoload {
+                self.panes[p].inject.push_back(format!("[LLM Duo] WARNING: {}", super::pane_r::TREE_I8_WARNING));
+            } else {
+                self.ask(
+                    &format!("{}\n\nLoad anyway?", super::pane_r::TREE_I8_WARNING),
+                    "yesno",
+                    super::app::Pending::LoadTreeI8(p),
+                );
+                return;
+            }
+        }
+        self.panes[p].tree_i8_confirmed = false;
         // never start something the estimate says won't fit without saying so
         self.update_estimate(p);
         let confirmed = std::mem::take(&mut self.panes[p].load_confirmed);
@@ -412,6 +450,18 @@ impl App {
                 env.push((k.clone(), v.clone()));
             }
         }
+        // Radiance 2.0+: the flags become a YAML file and radiance is started on it
+        let (run_cmd, rad_yaml) = if self.panes[p].is_rad() {
+            match self.r_launch_cmd(&cmd, &env, self.panes[p].side) {
+                Ok(x) => x,
+                Err(e) => {
+                    self.msg("error", &format!("Could not write Radiance's configuration:\n{e}"));
+                    return;
+                }
+            }
+        } else {
+            (cmd.clone(), String::new())
+        };
         {
             let pane = &mut self.panes[p];
             pane.cmd = cmd.clone();
@@ -426,8 +476,9 @@ impl App {
         let mut first = vec![format!(
             "$ {} {}",
             env_text(&env_extra),
-            shlex_join(&mask_cmd(&cmd))
+            shlex_join(&mask_cmd(&run_cmd))
         )];
+        first.extend(super::radiance::yaml_log_lines(&rad_yaml));
         if !self.panes[p].is_vllm() {
             first.extend(self.panes[p].k_env_notes.clone());
         }
@@ -443,7 +494,7 @@ impl App {
         // drain stale messages of an earlier run
         while self.panes[p].proc_rx.try_recv().is_ok() {}
         let tx = self.panes[p].proc_tx.clone();
-        match proc::spawn(&cmd, &env, pty, tx) {
+        match proc::spawn(&run_cmd, &env, pty, tx) {
             Ok(pr) => self.panes[p].proc = Some(pr),
             Err(e) => {
                 self.panes[p].proc = None;

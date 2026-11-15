@@ -42,6 +42,16 @@ pub struct Probe {
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Shown before Load when Radiance 2.0 would accept the settings and then fail the first request.
+pub const TREE_I8_WARNING: &str = "RADIANCE 2.0 WILL FAIL THIS MODEL ON ITS FIRST REQUEST.\n\n\
+This container's DFlash2 drafter is verified as a draft tree (Gemma 4 + DFlash2), and Radiance 2.0's \
+tree code cannot move rows of the i8 KV cache (516-byte rows; it needs a multiple of 16). It loads and \
+reports ready, then stops with \"KV group N's cache (i8, 516-byte rows) is not one a tree's acceptance \
+can move\" and refuses every request after it.\n\n\
+Radiance 1.17 served this with its fp8 cache (512-byte rows); 2.0 replaced fp8 with i8 and serves fp8 \
+for GLM-5.3 only. Settings that run today: Spec tokens 0 (i8 kept, no drafter), or KV cache bf16 \
+(drafter kept, about half the context). LLM Duo changes neither for you.";
+
 fn list_or(v: String, list: &[&str], d: &str) -> String {
     if list.contains(&v.as_str()) { v } else { d.to_string() }
 }
@@ -56,7 +66,7 @@ impl App {
         let mut o = Map::new();
         o.insert("ctx".into(), v.int("ctx", 32768).max(0).into());
         o.insert("parallel".into(), v.int("parallel", 1).max(1).into());
-        o.insert("r_kv".into(), list_or(v.var_s("r_kv"), &RAD_KV_TYPES, "fp8").into());
+        o.insert("r_kv".into(), list_or(v.var_s("r_kv"), &RAD_KV_TYPES, "i8").into());
         o.insert("r_batched".into(), v.int("r_batched", 2048).max(64).into());
         o.insert("r_headroom".into(), v.int("r_headroom", 96).max(0).into());
         o.insert("r_spec".into(), spec.into());
@@ -79,6 +89,28 @@ impl App {
         o.insert("extra".into(), Value::from(v.var_s("extra")));
         o
     }
+
+    /// The pre-Load warning for the tree-drafter + i8 combination (r_tree_blocks_i8).
+    pub fn r_tree_note(&self) -> &'static str {
+        TREE_I8_WARNING
+    }
+
+    /// This container's drafter is verified as a tree (Gemma 4 + DFlash2), speculation is on and
+    /// the i8 cache is asked for: a combination Radiance 2.0 accepts at startup and then fails on
+    /// the first request ("KV group N's cache (i8, 516-byte rows) is not one a tree's acceptance
+    /// can move"). Speculation off (Spec tokens 0) makes i8 safe again.
+    pub fn r_tree_blocks_i8(&self, p: usize, o: &Opts) -> bool {
+        let tree = self.panes[p].info_r().map(|i| i.tree_drafter).unwrap_or(false);
+        if !tree || gs(o, "r_kv", "i8") != "i8" {
+            return false;
+        }
+        let extra = shlex_split(&gs(o, "extra", "")).unwrap_or_default();
+        let spec_off_extra = extra.windows(2).any(|w| w[0] == "--num-speculative-tokens" && w[1] == "0")
+            || extra.iter().any(|a| a == "--num-speculative-tokens=0");
+        gs(o, "r_spec", "auto") != "0" && !spec_off_extra
+    }
+
+
 
     pub fn r_prepare_options(&mut self, _p: usize, s: &mut Opts) {
         s.insert("dual_strategy".into(), RAD_STRATEGIES[0].into());
@@ -131,6 +163,107 @@ impl App {
             rec.insert("sig".into(), i.sig().into());
         }
         self.settings.set_calib(&key, rel, rec);
+    }
+
+    // ======================================================= prefix cache ==
+    /// Remember what a token of context costs in the host tier, as the running engine said, for
+    /// this model, these cards and this KV cache type.
+    fn r_save_prefix_bpt(&mut self, p: usize, bpt: f64) {
+        let Some((rel, opts, _)) = self.panes[p].loaded.clone() else { return };
+        let key = self.dev_key(p);
+        let mut rec = self.settings.get_calib(&key, &rel).unwrap_or_default();
+        rec.insert("radiance".into(), true.into());
+        let mut m = rec.get("prefix_bpt").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        m.insert(gs(&opts, "r_kv", "i8"), json!(bpt.round()));
+        rec.insert("prefix_bpt".into(), Value::Object(m));
+        self.settings.set_calib(&key, &rel, rec);
+    }
+
+    /// What the prefix-cache calculator needs: the host-tier cost of a token of context for the
+    /// selected model / cards / KV cache type, where that figure came from, the context a
+    /// conversation can reach, and the system memory it would be pinned from.
+    pub fn r_prefix_calc(&self, p: usize) -> Value {
+        let s = self.r_current_options(p);
+        let kv = gs(&s, "r_kv", "i8");
+        let ranks = self.r_devs(p).len().max(1) as f64;
+        let info = self.panes[p].info_r();
+        let ctx = match gi(&s, "ctx", 0) {
+            0 => info.as_ref().map(|i| i.n_ctx_train).unwrap_or(0),
+            c => c,
+        };
+        let rel = &self.panes[p].model_var;
+        let rec = self.settings.get_calib(&self.dev_key(p), rel).unwrap_or_default();
+        // relative bytes a token of each cache type, for carrying a figure across types
+        let w = |t: &str| match t {
+            "bf16" => 2.0,
+            "fp8" | "i8" => 1.0,
+            "fp8_v4" => 0.75,
+            "k6_v4" => 0.625,
+            _ => 1.0,
+        };
+        let mut bpt = None;
+        let mut source = String::new();
+        let mut exact = false;
+        let measured = rec.get("prefix_bpt").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        if let Some(b) = measured.get(&kv).and_then(|v| v.as_f64()) {
+            bpt = Some(b);
+            exact = true;
+            source = format!("measured: Radiance's own kv tiers line for this model at KV cache {kv}");
+        } else if let Some((t, b)) = measured.iter().find_map(|(t, v)| v.as_f64().map(|b| (t.clone(), b))) {
+            bpt = Some(b * w(&kv) / w(&t));
+            source = format!("scaled from Radiance's kv tiers line at KV cache {t} (approximate)");
+        }
+        if bpt.is_none() {
+            // the KV pool a load built: GiB a card over tokens, times the cards (one host slot
+            // holds every rank's shard)
+            let pools = rec.get("pools").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            let mut best: Option<(bool, String, f64)> = None;
+            for (fp, v) in &pools {
+                let Some(o) = v.as_object() else { continue };
+                let (Some(g), t) = (o.get("kv_gib").and_then(|v| v.as_f64()), gi(o, "kv_tokens", 0)) else { continue };
+                if t <= 0 || g <= 0.0 {
+                    continue;
+                }
+                let pkv = fp.split('|').nth(1).and_then(|x| x.split(',').next()).unwrap_or("i8").to_string();
+                let b = g * GIB / t as f64 * ranks * w(&kv) / w(&pkv);
+                let same = pkv == kv;
+                if best.as_ref().map(|x| same && !x.0).unwrap_or(true) {
+                    best = Some((same, pkv, b));
+                }
+            }
+            if let Some((same, pkv, b)) = best {
+                bpt = Some(b);
+                source = if same {
+                    format!("estimated from the KV pool a load built at KV cache {kv} (a load with Prefix cache on measures it exactly)")
+                } else {
+                    format!("estimated from a load at KV cache {pkv}, scaled to {kv} (approximate)")
+                };
+            }
+        }
+        // pinned host memory already asked for: since 2.0 the host pool is the model's total,
+        // split among its cards (1.x pinned it on every card)
+        let host_pool = gi(&s, "r_host_pool", 0) as f64 * MIB * if self.r_config_mode() { 1.0 } else { ranks };
+        json!({
+            "ok": bpt.is_some(),
+            "bpt": bpt.unwrap_or(0.0),
+            "exact": exact,
+            "source": if bpt.is_some() { source } else {
+                "no measurement yet for this model on these cards: Load it once (better with Prefix cache set to any size, \
+                 e.g. 1024, so Radiance states the exact figure), then open this again".to_string()
+            },
+            "ctx": ctx,
+            "seqs": gi(&s, "parallel", 1).max(1),
+            "kv": kv,
+            "ranks": ranks as i64,
+            "current": gi(&s, "r_prefix_mib", 0),
+            "key": "r_prefix_mib",
+            "flag": "--prefix-cache-mib",
+            "pinned": true,
+            "otherPinned": host_pool,
+            "otherPinnedName": "Host pool",
+            "what": "Radiance copies a finished conversation's KV to pinned system RAM, so returning to it restores in a \
+                     fraction of a second instead of re-reading the whole prompt. A tier smaller than a conversation keeps only its start.",
+        })
     }
 
     // =========================================================== estimate ==
@@ -353,7 +486,7 @@ impl App {
         let seqs = gi(&s, "parallel", 1).max(1);
         let cap = self.panes[p].info_r().map(|i| i.n_ctx_train).unwrap_or(0);
         if tokens < 1024 {
-            self.msg("warning", &format!("Radiance's KV pool holds only {} tokens with these settings.\n\nTry: fp8 KV cache, a smaller Batch tokens or Max seqs, Vision tower → ram, or a Host pool (MoE models).", tokens));
+            self.msg("warning", &format!("Radiance's KV pool holds only {} tokens with these settings.\n\nTry: the i8 KV cache, a smaller Batch tokens or Max seqs, Vision tower → ram, or a Host pool (MoE models).", tokens));
             return;
         }
         let ctx = r_fit_ctx(tokens, seqs, cap);
@@ -394,6 +527,13 @@ impl App {
             env.retain(|e| &e.0 != k);
             env.push((k.clone(), v.clone()));
         }
+        let (cmd, yaml) = match self.r_launch_cmd(&cmd, &env, &format!("{}-plan", self.panes[p].side)) {
+            Ok(x) => x,
+            Err(e) => {
+                self.msg("error", &format!("Could not write Radiance's configuration for the plan check:\n{e}"));
+                return;
+            }
+        };
         let (tx, rx) = channel();
         let pr = match proc::spawn(&cmd, &env, false, tx) {
             Ok(pr) => pr,
@@ -427,7 +567,9 @@ impl App {
             env_text(&env_extra),
             shlex_join(&cmd)
         );
-        self.append_log(p, &[format!("[LLM Duo] Fit: plan check (stopped as soon as Radiance states its KV pool){}", if ctx > 0 { format!(" at context {}", fmt_thousands(ctx)) } else { String::new() }), shown]);
+        let mut log = vec![format!("[LLM Duo] Fit: plan check (stopped as soon as Radiance states its KV pool){}", if ctx > 0 { format!(" at context {}", fmt_thousands(ctx)) } else { String::new() }), shown];
+        log.extend(super::radiance::yaml_log_lines(&yaml));
+        self.append_log(p, &log);
         self.set_top_status(format!(
             "{} pane: Fit is asking Radiance for its memory plan… (press Fit again to cancel)",
             cap_side(self.panes[p].side)
@@ -590,7 +732,8 @@ impl App {
         }
         let name = {
             let n = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            n.strip_suffix(".rad").map(String::from).unwrap_or(n)
+            // 2.0 reserves ':' for base:adapter
+            n.strip_suffix(".rad").map(String::from).unwrap_or(n).replace(':', "-")
         };
         let mut cmd: Vec<String> = vec![
             expanduser(&gs(&g, "radiance_bin", "radiance")).to_string_lossy().into_owned(),
@@ -605,7 +748,7 @@ impl App {
             "--max-model-len".into(),
             probe_ctx.unwrap_or_else(|| gi(&s, "ctx", 32768)).to_string(),
             "--kv-cache-dtype".into(),
-            gs(&s, "r_kv", "fp8"),
+            gs(&s, "r_kv", "i8"),
             "--max-num-seqs".into(),
             gi(&s, "parallel", 1).to_string(),
             "--max-num-batched-tokens".into(),
@@ -701,8 +844,25 @@ impl App {
     pub fn r_key_in_env(&self, p: usize) -> bool {
         self.panes[p].is_rad() && {
             let bin = expanduser(&gs(self.settings.g(), "radiance_bin", "radiance"));
-            binary_has_flag(&bin, "--api-key-env")
+            uses_config(&bin) || binary_has_flag(&bin, "--api-key-env")
         }
+    }
+
+    /// The radiance binary in Settings reads a YAML file (2.0+) rather than flags.
+    pub fn r_config_mode(&self) -> bool {
+        uses_config(&expanduser(&gs(self.settings.g(), "radiance_bin", "radiance")))
+    }
+
+    /// The command that actually starts radiance for this flag line: itself for a 1.x binary;
+    /// for 2.0+, `radiance --config FILE` with the flags turned into that file. `tag` names the
+    /// file. Returns the command and the YAML (empty for 1.x).
+    pub fn r_launch_cmd(&self, flags: &[String], env: &[(String, String)], tag: &str) -> Result<(Vec<String>, String), String> {
+        if !self.r_config_mode() {
+            return Ok((flags.to_vec(), String::new()));
+        }
+        let path = config_path(tag);
+        let yaml = write_config(flags, env, &path)?;
+        Ok((vec![flags[0].clone(), "--config".into(), path.to_string_lossy().into_owned()], yaml))
     }
 
     pub fn r_monitors(&self, p: usize) -> Vec<Mon> {
@@ -763,6 +923,9 @@ impl App {
                 self.panes[p].r_kv_bytes = Some(gib_of(&c[1], &c[2]));
             }
             shown = true;
+        }
+        if let Some(bpt) = tier_bytes_per_token(line) {
+            self.r_save_prefix_bpt(p, bpt);
         }
         if let Some(c) = re.backs.captures(line) {
             self.panes[p].r_backs = c[1].parse().ok();
@@ -1065,3 +1228,4 @@ mod tests {
         assert_eq!(r_fit_ctx(1500, 1, 0), 1280);
     }
 }
+

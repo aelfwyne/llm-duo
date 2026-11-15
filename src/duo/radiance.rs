@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use super::util::*;
 
-pub const RAD_KV_TYPES: [&str; 4] = ["bf16", "fp8", "fp8_v4", "k6_v4"];
+/// 2.0 dropped fp8 (GLM-5.3-Flash only) and the packed fp8_v4 / k6_v4 caches; i8 is the 8-bit cache.
+pub const RAD_KV_TYPES: [&str; 2] = ["bf16", "i8"];
 pub const RAD_SPEC: [&str; 9] = ["auto", "0", "1", "2", "3", "4", "5", "6", "8"];
 pub const RAD_DRAFT_WINDOW: [&str; 2] = ["fixed", "adaptive"];
 pub const RAD_VISION: [&str; 3] = ["(default)", "vram", "ram"];
@@ -60,6 +61,58 @@ pub fn binary_has_flag(bin: &Path, flag: &str) -> bool {
         run_capture(&cmd, &[], Duration::from_secs(5)).map(|x| x.1).unwrap_or_default()
     });
     help_has_flag(help, flag)
+}
+
+/// Radiance 2.0 and later read every setting from a YAML file (`radiance --config FILE`); the
+/// command-line flags are gone from the server.
+pub fn uses_config(bin: &Path) -> bool {
+    binary_has_flag(bin, "--config")
+}
+
+/// Where a pane's generated Radiance configuration is written (`tag`: "left", "left-plan", …).
+pub fn config_path(tag: &str) -> PathBuf {
+    dirs().data.join("radiance").join(format!("{tag}.yaml"))
+}
+
+/// Turn a 1.x-style flag line (`cmd[0]` the radiance binary, then its flags) into the YAML file
+/// 2.0 reads, with `rad-yaml` from the same folder: Radiance's own parser, so every flag (Extra
+/// args included) lands at the level it belongs to, and a flag the server would refuse is refused
+/// here with the server's message. Writes it to `path` and returns the YAML text.
+pub fn write_config(cmd: &[String], env: &[(String, String)], path: &Path) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    let bin = cmd.first().ok_or("empty command")?;
+    let tool = tool_path(bin, "rad-yaml");
+    let mut c = Command::new(&tool);
+    c.args(&cmd[1..]).stdin(Stdio::null()).env_clear();
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let out = c.output().map_err(|e| format!("{}: {e}\n(rad-yaml ships with Radiance 2.0, next to the radiance binary)", tool.display()))?;
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        return Err(if err.is_empty() { format!("rad-yaml failed ({})", out.status) } else { err });
+    }
+    let yaml = String::from_utf8_lossy(&out.stdout).into_owned();
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    std::fs::write(path, &yaml).map_err(|e| format!("{}: {e}", path.display()))?;
+    {
+        // an api-key given in Extra args lands in the file
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(yaml)
+}
+
+/// The configuration as log lines, indented under the command, with any `api-key:` hidden.
+pub fn yaml_log_lines(yaml: &str) -> Vec<String> {
+    yaml.lines()
+        .map(|l| match l.split_once("api-key:") {
+            Some((pre, _)) if pre.trim().is_empty() => format!("    {pre}api-key: ••••"),
+            _ => format!("    {l}"),
+        })
+        .collect()
 }
 
 fn help_has_flag(help: &str, flag: &str) -> bool {
@@ -200,6 +253,10 @@ pub struct RadInfo {
     pub n_layer: usize,
     pub vision: bool,
     pub draft: bool,
+    /// A drafter Radiance 2.0 verifies as a tree (Gemma 4 with DFlash2, RadArchProbe::tree_pays).
+    /// A tree's acceptance cannot move an i8 KV cache's rows, so with speculation on and
+    /// `kv-cache-dtype: i8` the engine stops on the first request; LLM Duo serves it at bf16.
+    pub tree_drafter: bool,
     pub kind: RadKind,
     /// `decision.type` of a decision model
     pub decision: String,
@@ -355,6 +412,11 @@ impl RadInfo {
         if low.contains("draft.") || low.contains("draft head") {
             self.draft = true;
         }
+        // the test Radiance's gemma4 plugins make (arch/common/rad_gemma4_dflash.h: dflash2_probe)
+        let meta = |k: &str| self.meta.iter().find(|m| m.0 == k).map(|m| m.1.split_whitespace().last().unwrap_or("").to_string());
+        let draft_arch = self.meta.iter().find(|m| m.0 == "draft.architectures").map(|m| m.1.clone()).unwrap_or_default();
+        let block = meta("draft.block_size").or_else(|| meta("draft.dflash_config.block_size")).and_then(|b| b.parse::<i64>().ok()).unwrap_or(0);
+        self.tree_drafter = self.arch.to_lowercase().starts_with("gemma4") && draft_arch.contains("DFlash2") && block > 1;
         if !self.decision.is_empty() {
             self.kind = RadKind::Decision;
         } else if self.kind == RadKind::Generate {
@@ -446,7 +508,8 @@ pub struct RRe {
 pub fn rre() -> &'static RRe {
     static R: OnceLock<RRe> = OnceLock::new();
     R.get_or_init(|| RRe {
-        serving: Regex::new(r"\bserving on\b").unwrap(),
+        // 1.x: "serving on http://…"; 2.0: "model NAME serves  (/v1/completions; …)" once it is open
+        serving: Regex::new(r"\bserving on\b|\bmodel \S+ serves\s").unwrap(),
         // "kv cache 11.59 GiB = 262,160 tokens of context" (wording varies a little by version)
         kv_tokens: Regex::new(r"(?i)\bkv\b.*?(\d[\d,_]*)\s+tokens(?: of context)?\b").unwrap(),
         kv_gib: Regex::new(r"(?i)\bkv cache\b[^\d]*?([\d.]+)\s*(GiB|MiB)").unwrap(),
@@ -465,6 +528,28 @@ pub fn rre() -> &'static RRe {
 pub fn gib_of(v: &str, unit: &str) -> f64 {
     let x: f64 = v.parse().unwrap_or(0.0);
     if unit.eq_ignore_ascii_case("mib") { x * MIB } else { x * GIB }
+}
+
+/// What one token of context costs in the prefix cache's host tier (--prefix-cache-mib), in
+/// bytes, from the "kv tiers:" line Radiance prints when the tier is on. Both forms name it:
+/// "... copied to host memory at once (2.00 GiB, 8 entries, 64000 tokens of context) ..." and
+/// "--prefix-cache-mib 512 holds 9000 tokens of context (29.00 KiB per 4-token block) ...".
+pub fn tier_bytes_per_token(line: &str) -> Option<f64> {
+    static R: OnceLock<(Regex, Regex)> = OnceLock::new();
+    let (whole, block) = R.get_or_init(|| {
+        (
+            Regex::new(r"kv tiers:.*?\(([\d.]+)\s*(B|KiB|MiB|GiB|TiB),\s*\d+ entries,\s*(\d+) tokens of context\)").unwrap(),
+            Regex::new(r"kv tiers:.*?\(([\d.]+)\s*(B|KiB|MiB|GiB|TiB) per (\d+)-token block\)").unwrap(),
+        )
+    });
+    let c = block.captures(line).or_else(|| whole.captures(line))?;
+    let unit = match &c[2] {
+        "TiB" => GIB * 1024.0,
+        u => bytes_of("1", u),
+    };
+    let bytes = c[1].parse::<f64>().ok()? * unit;
+    let tokens: f64 = c[3].parse().ok()?;
+    if bytes > 0.0 && tokens > 0.0 { Some(bytes / tokens) } else { None }
 }
 
 /// The KV pool in tokens from one log line, if it states it.
@@ -626,7 +711,7 @@ pub fn rad_failure_hint(lines: &[String]) -> String {
         return "Some ops have no kernel for this card (only the reference implementation).\nCheck Radiance home in Settings (it must hold kernels/, architectures/ and quantizers/), or rebuild Radiance for this GPU.".into();
     }
     if m(r"DID NOT FIT|did not fit the KV pool") {
-        return "The memory plan did not fit.\nLower Context or Max seqs, use an fp8 KV cache, lower Batch tokens (a smaller activation arena), put the vision tower in RAM, or give it a Host pool (MoE models).".into();
+        return "The memory plan did not fit.\nLower Context or Max seqs, use the i8 KV cache, lower Batch tokens (a smaller activation arena), put the vision tower in RAM, or give it a Host pool (MoE models).".into();
     }
     if m(r"unknown option '([^']*)'") {
         let o = Regex::new(r"unknown option '([^']*)'").unwrap().captures(&text).map(|c| c[1].to_string()).unwrap_or_default();
@@ -647,8 +732,19 @@ pub fn rad_failure_hint(lines: &[String]) -> String {
     if m(r"(?i)vision-tower-placement.*(?:refused|no tower|cannot)|no (?:vision )?tower") {
         return "This model has no vision tower to move to RAM - set Vision tower to (default).".into();
     }
-    if m(r"(?i)kv-cache-dtype.*(?:refus|not offered|unsupported)|refuses? (?:fp8_v4|k6_v4)") {
-        return "That KV cache type is only offered for some models (fp8_v4 / k6_v4: Qwen3.8-27B and Flash-Next). Use fp8 or bf16.".into();
+    if m(r"(?i)kv-cache-dtype.*(?:refus|not offered|unsupported|no longer served|takes bf16)|refuses? (?:fp8_v4|k6_v4)") {
+        return "Radiance does not serve that KV cache type for this model. Use i8 or bf16 (fp8 is GLM-5.3-Flash only).".into();
+    }
+    if let Some(c) = Regex::new(r"'([^']+)' is stored as ([^,]+?), which this build does not serve").unwrap().captures(&text) {
+        let drafter = c[1].starts_with("dflash") || c[1].starts_with("mtp") || c[1].contains("draft");
+        return format!(
+            "Radiance 2.0 no longer serves {} weights ('{}'): block FP8, MXFP4, M2XFP4, NVFP4 and ParoQuant containers are refused.\n{}Convert the checkpoint again with an int8 recipe (the IQ8R ones), or keep Radiance 1.17 for this container.",
+            &c[2], &c[1],
+            if drafter { "It is the drafter's weight: Spec tokens = 0 serves the model without it.\n" } else { "" }
+        );
+    }
+    if m(r"(?i)takes its settings from a YAML file") {
+        return "This Radiance (2.0+) only reads a YAML configuration, and LLM Duo could not hand it one.\nCheck that rad-yaml is next to the radiance binary.".into();
     }
     if m(r"(?i)no queue advance|GPU Hang|MODE1 reset") {
         return "The GPU stopped running Radiance's queue and was reset.\nUsually compute wave save/restore is off: cat /sys/module/amdgpu/parameters/cwsr_enable must print 1. A GPU voltage offset is the other known cause.".into();
@@ -813,10 +909,11 @@ impl RecipeKind {
     }
 }
 
-/// Recipes that name data files relative to the Radiance repository (`vq=data/codebooks/…`).
+/// Recipes that name data files relative to the Radiance repository (`vq=data/codebooks/…`,
+/// `tcq_lut=data/codebooks/…`): any rule option whose value starts with `data/`.
 pub fn recipe_needs_repo_cwd(text: &str) -> bool {
     static R: OnceLock<Regex> = OnceLock::new();
-    let re = R.get_or_init(|| Regex::new(r"(?m)^\s*[^#\s].*\b(?:vq|tcq|table)=data/").unwrap());
+    let re = R.get_or_init(|| Regex::new(r"(?m)^\s*[^#\s].*\s[A-Za-z0-9_]+=(?:\./)?data/").unwrap());
     re.is_match(text)
 }
 
@@ -1004,6 +1101,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tier_lines() {
+        let a = tier_bytes_per_token("W kv tiers: --prefix-cache-mib 512 holds 9000 tokens of context (29.00 KiB per 4-token block), less than one --max-model-len 16384 conversation").unwrap();
+        assert!((a - 29.0 * 1024.0 / 4.0).abs() < 1e-6, "{a}");
+        let b = tier_bytes_per_token("I kv tiers: a finished conversation's KV is copied to host memory at once (2.00 GiB, 8 entries, 64000 tokens of context) and its VRAM is given up").unwrap();
+        assert!((b - 2.0 * GIB / 64000.0).abs() < 1e-6, "{b}");
+        assert_eq!(tier_bytes_per_token("I kv tiers: off (no --prefix-cache-mib); a finished conversation's KV stays in VRAM until the cache evicts it"), None);
+        assert_eq!(tier_bytes_per_token("I kv cache 11.59 GiB = 262,160 tokens of context"), None);
+    }
+
+    #[test]
     fn log_lines() {
         assert_eq!(kv_tokens_of("I kv cache 11.59 GiB = 262,160 tokens of context"), Some(262160));
         assert_eq!(kv_tokens_of("I   kv cache: fp8, 40.00 KiB a token, 262160 tokens of context (1 x 262144)"), Some(262160));
@@ -1019,6 +1126,8 @@ mod tests {
         let s = rre().settled.captures("I card 0 settled at 1.21 GiB free (the budget read 1.30)").unwrap();
         assert_eq!(&s[2], "1.21");
         assert!(rre().serving.is_match("I serving on http://0.0.0.0:8080 (chat, completions)"));
+        assert!(rre().serving.is_match("I model q38-27b serves  (/v1/completions; /v1/chat/completions with tools and reasoning)"));
+        assert!(!rre().serving.is_match("I server: listening on http://127.0.0.1:8080 (16 threads, up to 64)"));
     }
 
     #[test]
@@ -1079,6 +1188,8 @@ mod tests {
     fn hint() {
         let l = vec!["I x".to_string(), "E unknown option '--foo'".to_string()];
         assert!(rad_failure_hint(&l).contains("--foo"));
+        let f = vec!["radiance: 'dflash.fc.weight' is stored as block fp8, which this build does not serve. Convert the checkpoint again".to_string()];
+        assert!(rad_failure_hint(&f).contains("Spec tokens = 0"));
         let cwsr = vec![
             "E incompatible configuration: cwsr-off: amdgpu cwsr_enable is 0 -- the card hangs. Fix: amdgpu.cwsr_enable=1 as a module option".to_string(),
             "E radiance does not start on a configuration it does not support: the fix for each is said above.".to_string(),
@@ -1131,6 +1242,15 @@ mod tests {
     }
 
     #[test]
+    fn yaml_masked() {
+        let y = "server:\n  port: 8080\n  api-key: hunter2\nmodels:\n  m:\n    model: /m.rad\n";
+        let l = yaml_log_lines(y);
+        assert_eq!(l[2], "      api-key: ••••");
+        assert_eq!(l[1], "      port: 8080");
+        assert!(!l.join("\n").contains("hunter2"));
+    }
+
+    #[test]
     fn help_flags() {
         let h = "  --spec-ngram K   drafts\n  --api-key KEY  the key\n  --spec-ngram-min N  shortest";
         assert!(help_has_flag(h, "--spec-ngram"));
@@ -1144,6 +1264,21 @@ mod tests {
         assert!(!binary_has_flag(&bin, "--allow-host"));
         let _ = std::fs::remove_file(&bin);
         assert!(!binary_has_flag(&bin, "--api-key-env"), "a binary that can't be asked has no flags");
+    }
+
+    #[test]
+    fn tree_drafter() {
+        let meta = "  draft.architectures                           DFlash2DraftModel\n  draft.block_size                              8\n";
+        let mut g = RadInfo { summary_text: "  architecture  gemma4\n".into(), meta_text: meta.into(), ..Default::default() };
+        g.parse();
+        assert!(g.tree_drafter, "Gemma 4 with DFlash2 is verified as a tree");
+        let mut q = RadInfo { summary_text: "  architecture  qwen35\n".into(), meta_text: meta.into(), ..Default::default() };
+        q.parse();
+        assert!(!q.tree_drafter, "Qwen's DFlash2 is a chain");
+        let v1 = "  draft.architectures  DFlashDraftModel\n  draft.block_size  16\n";
+        let mut d = RadInfo { summary_text: "  architecture  gemma4\n".into(), meta_text: v1.into(), ..Default::default() };
+        d.parse();
+        assert!(!d.tree_drafter, "z-lab DFlash is a chain");
     }
 
     #[test]
@@ -1172,6 +1307,9 @@ mod tests {
         let iq = "# run from the repository root (vq=data/codebooks/x.txt in a comment does not count)\n\
                   blk.0.ssm_inz.weight gptq vq=data/codebooks/iqr-vq3-4x4096.txt group=128 calib=$CALIB\n";
         assert!(recipe_needs_repo_cwd(iq) && recipe_needs_calib(iq));
+        // IQR-V2..V4 name their trellis tables with tcq_lut=
+        let tcq = "token_embd.weight gptq codes=u3 tcq=12 tcq_rows=256 tcq_lut=data/codebooks/iqr-tcq-L12-k3.txt group=128\n";
+        assert!(recipe_needs_repo_cwd(tcq));
         let plain = "#   CALIB=<dir> rad-convert uses vq=data/codebooks/a.txt and $CALIB here\nblk.*.weight rtn codes=i8 group=128\n";
         assert!(!recipe_needs_repo_cwd(plain) && !recipe_needs_calib(plain));
     }

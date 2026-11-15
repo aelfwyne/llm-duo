@@ -139,13 +139,17 @@ Pick **Radiance** for a pane in Settings and fill in the Radiance section:
 
 The model list shows `.rad` containers and checkpoint folders (served at their own precision).
 `RADIANCE_HOME` and `HIP_VISIBLE_DEVICES` go on Radiance's own command line only, never into your
-shell, so the other card stays visible to everything else. *Copy command* gives the exact line,
-the same as the launch you tested by hand:
+shell, so the other card stays visible to everything else.
+
+**Radiance 2.0** reads its settings from a YAML file instead of command-line flags. LLM Duo still
+builds the familiar flag list (Extra args included), turns it into that file with `rad-yaml` from
+the same folder as the radiance binary, and starts `radiance --config FILE`. The files live in the
+data folder under `radiance/` (`left.yaml`, `right.yaml`, `*-plan.yaml` for Fit, `*-copy.yaml` for
+*Copy command*), and the log shows the command and the YAML. A 1.x binary still gets flags.
+*Copy command* gives a line that runs as is:
 
 ```
-RADIANCE_HOME=… HIP_VISIBLE_DEVICES=0 radiance --model …/gemma4-31b-heretic-ara-w4a8.rad \
-  --port 8080 --max-model-len 262144 --kv-cache-dtype fp8 --max-num-seqs 1 \
-  --max-num-batched-tokens 2048 --vision-tower-placement ram
+RADIANCE_HOME=… HIP_VISIBLE_DEVICES=0 RADIANCE_API_KEY=… radiance --config ~/.local/share/llm-duo/radiance/left-copy.yaml
 ```
 
 **Memory.** Radiance claims the whole card at startup and splits it between weights and its KV
@@ -159,7 +163,8 @@ Radiance, because it pins host memory on purpose (the embedding, and the vision 
 `ram`).
 
 **Defaults.** Max seqs is 1, because the engine's own 256 leaves only a few thousand tokens of
-context on a 32 GB card. KV cache defaults to fp8; the engine's default is bf16.
+context on a 32 GB card. KV cache defaults to i8 (Radiance 2.0's 8-bit cache, which replaced
+fp8); the engine's default is bf16. Host pool is the model's total, split among its cards.
 
 **Prompt lookup** (Radiance 1.15) drafts from the sequence's own n-grams with no draft model. Set
 Prompt lookup to the most drafts a step; it replaces Spec tokens while it is on. A container with
@@ -170,7 +175,12 @@ model summary. Embedding and rerank models read each input whole, so Batch token
 longest input. A model with no KV cache has nothing for Fit to measure, and Fit says so.
 
 **API key.** With Radiance 1.15.1 or later, the key from Settings reaches the server through
-`--api-key-env`, so it doesn't show in `ps`. Older builds get `--api-key` on the command line.
+`--api-key-env` (`server.api-key-env` in 2.0), so it doesn't show in `ps` or in the YAML file.
+Older builds get `--api-key` on the command line.
+
+**Gemma 4 31B with a DFlash2 drafter** fails its first request in Radiance 2.0 with the i8 KV
+cache (its draft trees can't move i8 rows). LLM Duo warns before Load and changes nothing; it runs
+with the bf16 cache, or with Spec tokens 0.
 
 **Dual GPU mode** runs `--tp 2` (tensor parallel), because Radiance has no layer split. The KV
 pool is sized to the tighter card, so an R9700 + 9070 XT pair usually holds less context than the
@@ -188,8 +198,18 @@ the `--set` keys the recipe's header asks for. It can also add a draft model, a 
 environment (such as `CALIB=`) and plan-only. The new container appears in the model list when it
 finishes.
 
-Recipes that read `$CALIB` show a warning until it is set, and those that use repository-relative
-codebooks run from the Radiance checkout, so the recipes folder has to stay inside it. Decision
+**Calibration Hessians.** Recipes fitted by GPTQ (`calib=$CALIB`) are marked "⚠ needs Hessians"
+in the Recipe list. Picking one pops up a warning, a banner holds the *Calibration data* folder
+(`gram.r*.bin` files) with a live check, and Start asks before converting without them.
+*Create Hessians…* records them for dense Qwen3.5 / Qwen3.8: it serves the bf16 checkpoint with
+Radiance 2.0's calibration mode over a corpus (a `.jsonl` file or a folder of text files), in
+layer slices when host RAM is short, converts the recordings into the files rad-convert reads, and
+sets Calibration data. The bf16 weights must fit the chosen cards (Qwen3.8-27B needs two 32 GB
+cards); Gemma 4 records its Hessians another way and isn't supported.
+
+Recipes that use repository-relative codebooks (`vq=`, `tcq_lut=`) run from the Radiance
+checkout, so the recipes folder has to stay inside it. The output is named after the recipe's
+format and the merged drafter (`-dflash2`, `-dflash`, `-assistant`, …). Decision
 checkpoints are recognised: clef gets `decision.type=clef`, `--arch clef` and its
 `joint_head.safetensors`, and Laya gets `decision.type=laya`. Laya folders with no `config.json`
 are listed too. Naming `--arch` in Extra args turns the clef additions off.
@@ -217,6 +237,44 @@ cargo test     # needs the Qt dev packages too, since the crate links Qt
 ```
 
 ## Changelog
+
+### 1.1.0
+
+Radiance 2.0 support.
+
+Added:
+
+- Radiance 2.0 launches: the flag list (Extra args included) becomes the YAML file 2.0 reads, via
+  `rad-yaml`, and radiance starts with `--config`. Load, Fit's plan check and *Copy command* all
+  use it; the log shows the YAML. A 1.x binary still gets flags.
+- Calibration Hessians in Convert: recipes that need them are marked in the Recipe list, picking
+  one or opening Convert with one selected pops up a warning, a banner holds the Calibration data
+  folder with a live check, and Start (Plan only included) asks before running without them.
+- *Create Hessians…*: records GPTQ Hessians for dense Qwen3.5 / Qwen3.8 with Radiance 2.0's
+  calibration mode, in layer slices when host RAM is short, and converts them into the
+  `gram.r0.<weight>.bin` files rad-convert reads.
+- A prefix-cache calculator (*Calc*) for llama.cpp `--cache-ram`, vLLM `--kv-offloading-size` and
+  Radiance `--prefix-cache-mib`: the system RAM for N finished conversations of a given length.
+- A warning before Load for Gemma 4 + DFlash2 with the i8 KV cache, which Radiance 2.0 loads and
+  then fails on the first request. Nothing is changed for you.
+- Error hints for Radiance 2.0's refusals: weight formats it no longer serves (block FP8, MXFP4, …)
+  and removed KV cache types.
+
+Changed:
+
+- KV cache types are bf16 and i8 (2.0 removed fp8, fp8_v4 and k6_v4); i8 is the default, and a
+  saved fp8 setting becomes i8.
+- Host pool is the model's total, split among its cards, as in 2.0 (1.x pinned it on every card).
+- With 2.0 the API key always travels in the environment, so it is never written to the YAML file.
+- A served model name has `:` replaced (2.0 reserves it for adapters).
+- Convert names the output after the merged drafter (`-dflash2`, `-dflash`, `-assistant`, …)
+  instead of `-mtp` for every drafter.
+
+Fixed:
+
+- Readiness on Radiance 2.0, which no longer logs "serving on".
+- Recipes whose codebooks are named by `tcq_lut=` (IQR-V2 to V4) run from the Radiance checkout.
+- Number boxes no longer rewrite the number while it is being typed.
 
 ### 1.0.0
 

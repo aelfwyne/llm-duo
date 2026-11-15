@@ -113,6 +113,9 @@ pub fn default_global() -> Opts {
     v.as_object().unwrap().clone()
 }
 
+/// llama-server's --cache-ram when it is not given (MiB; -1 = no limit, 0 = off).
+pub const LLAMA_CACHE_RAM_DEFAULT: i64 = 8192;
+
 pub fn default_model() -> Opts {
     json!({
         "ctx": 8192,
@@ -124,6 +127,7 @@ pub fn default_model() -> Opts {
         "threads": 0,
         "batch": 2048,
         "ubatch": 512,
+        "cache_ram": 8192,
         "jinja": true,
         "relax_tpl": false,
         "dual_strategy": "Auto Balance",
@@ -153,6 +157,7 @@ pub fn default_vllm_model() -> Opts {
         "parallel": 1,
         "max_batched": 0,
         "cpu_offload": 0,
+        "kv_offload": 0,
         "eager": false,
         "text_only": false,
         "reasoning": null,
@@ -177,7 +182,7 @@ pub fn default_rad_model() -> Opts {
     json!({
         "ctx": 32768,
         "parallel": 1,
-        "r_kv": "fp8",
+        "r_kv": "i8",
         "r_batched": 2048,
         "r_headroom": 96,
         "r_spec": "auto",

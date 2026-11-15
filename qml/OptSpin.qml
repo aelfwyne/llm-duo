@@ -36,10 +36,33 @@ QQC2.SpinBox {
     // Typing into the box breaks contentItem.text's binding, so after an edit the box would keep
     // showing the typed number even when the backend changes the value (switching models restores
     // that model's saved Context, Fit, …). Whenever the backend value changes, show it again.
+    //
+    // The KDE desktop style commits every keystroke (value = typed number, clamped to from..to,
+    // then valueModified), so the backend value also changes while the user types. Re-showing it
+    // then would rewrite the text under the cursor ("8192" ← backspace → "819" → "819" again with
+    // the cursor moved, "2" → "512" because of the clamp). While the box is being edited, only a
+    // value that differs from what the typed text means is an outside change worth showing.
     readonly property int backendValue: parsed()
-    onBackendValueChanged: {
+    function clampedTyped() {
+        const t = String(spin.contentItem.text).trim()
+        if (t === "") return NaN
+        const v = spin.valueFromText(t, spin.locale)
+        return isNaN(v) ? NaN : Math.max(spin.from, Math.min(spin.to, v))
+    }
+    function showBackend() {
         spin.value = Qt.binding(function () { return spin.parsed() })
         spin.contentItem.text = Qt.binding(function () { return spin.displayText })
+    }
+    onBackendValueChanged: {
+        if (spin.contentItem.activeFocus && clampedTyped() === backendValue) return
+        showBackend()
+    }
+    // leaving the box: show the value that counts (a typed "2" in Context became 512)
+    Connections {
+        target: spin.contentItem
+        function onActiveFocusChanged() {
+            if (!spin.contentItem.activeFocus) spin.showBackend()
+        }
     }
 
     // the pane is about to act (Load, Fit, …): a number typed but not yet confirmed counts now
@@ -53,8 +76,7 @@ QQC2.SpinBox {
             const c = Math.max(spin.from, Math.min(spin.to, v))
             spin.pane.setVar(spin.key, spin.scale === 1 ? String(c) : (c / spin.scale).toFixed(spin.decimals))
             spin.value = c
-            spin.value = Qt.binding(function () { return spin.parsed() })   // keep following the backend (Fit, …)
-            spin.contentItem.text = Qt.binding(function () { return spin.displayText })
+            spin.showBackend()   // keep following the backend (Fit, …)
         }
     }
 

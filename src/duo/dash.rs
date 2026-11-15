@@ -96,11 +96,11 @@ fn insight(id: &str, scope: &str, level: &str, title: &str, text: String) -> Val
 }
 
 /// Display order of load options in the history window (keys not listed come last, sorted).
-const OPT_ORDER: [&str; 48] = [
+const OPT_ORDER: [&str; 50] = [
     "ctx", "ngl", "n_cpu_moe", "fa", "kv", "kv_dtype", "r_kv", "dtype", "quant", "gpu_util", "parallel", "batch", "ubatch",
     "max_batched", "r_batched", "threads", "cpu_offload", "mtp", "mtp_n", "r_spec", "r_draft_window", "r_spec_ngram",
     "r_ngram_min", "r_ngram_max", "r_headroom", "r_vision", "r_embed", "r_placement", "r_host_pool", "r_prefix_mib",
-    "r_prefill_span", "mmproj", "reasoning", "r_reasoning", "jinja", "relax_tpl", "eager", "text_only", "dual_strategy",
+    "cache_ram", "kv_offload", "r_prefill_span", "mmproj", "reasoning", "r_reasoning", "jinja", "relax_tpl", "eager", "text_only", "dual_strategy",
     "dual_mode", "dual_ts", "dual_first", "dual_moe_spread", "mtp_dev", "r_tp_wire", "extra", "kbuild", "kquiet",
 ];
 
@@ -138,7 +138,7 @@ fn opt_label(k: &str, backend: &str) -> String {
         "r_embed" => "Embedding",
         "r_placement" => "Placement",
         "r_host_pool" => "Host pool",
-        "r_prefix_mib" => "Prefix cache",
+        "r_prefix_mib" | "cache_ram" | "kv_offload" => "Prefix cache",
         "r_prefill_span" => "Prefill span",
         "mmproj" => "mmproj",
         "reasoning" | "r_reasoning" => "Reasoning",
@@ -850,13 +850,13 @@ impl App {
         if pane.is_rad() {
             if let Some(pre) = metrics.get("radiance:num_requests_preempted").filter(|x| **x > 0.0) {
                 out.push((2, insight(&id("preempted"), scope, "warning", &format!("{} request(s) preempted", *pre as i64),
-                    "The KV pool ran out while requests were running, so Radiance paused one to make room. Lower Max seqs or Context, use an fp8 KV cache, or move the vision tower to RAM.".into())));
+                    "The KV pool ran out while requests were running, so Radiance paused one to make room. Lower Max seqs or Context, use the i8 KV cache, or move the vision tower to RAM.".into())));
             }
             let seqs = pane.loaded.as_ref().map(|(_, o, _)| gi(o, "parallel", 1)).unwrap_or(1);
             if let (Some(b), true) = (pane.r_backs.filter(|b| *b < 99.5), seqs <= 1) {
                 let lim = pane.r_kv_tokens.map(|t| format!(" (about {} tokens)", fmt_thousands(t))).unwrap_or_default();
                 out.push((2, insight(&id("pool-short"), scope, "warning", &format!("Context is larger than the KV pool ({b:.0}%)"),
-                    format!("A prompt longer than the pool{lim} is refused. Press Fit (it sets Context to what the pool holds), or use an fp8 KV cache."))));
+                    format!("A prompt longer than the pool{lim} is refused. Press Fit (it sets Context to what the pool holds), or use the i8 KV cache."))));
             }
             let ev = metrics.get("radiance:prefix_cache_evictions_total").cloned().unwrap_or(0.0);
             let tier_off = pane.loaded.as_ref().map(|(_, o, _)| gi(o, "r_prefix_mib", 0) == 0).unwrap_or(true);

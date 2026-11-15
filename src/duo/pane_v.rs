@@ -406,6 +406,11 @@ impl App {
         if co > 0.0 {
             cmd.extend(["--cpu-offload-gb".into(), py_g(co)]);
         }
+        // KV offloading to CPU RAM (GiB, all ranks together): vLLM's host prefix cache
+        let ko = gf(&s, "kv_offload", 0.0);
+        if ko > 0.0 {
+            cmd.extend(["--kv-offloading-size".into(), py_g(ko)]);
+        }
         if gb(&s, "eager", false) {
             cmd.push("--enforce-eager".into());
         }

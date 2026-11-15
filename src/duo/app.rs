@@ -38,8 +38,10 @@ pub enum Pending {
     QuitQuant,
     ConvReplace,
     LoadAnyway(usize),
+    LoadTreeI8(usize),
     ConvDeleteUnfinished(PathBuf),
     ConvCloseRunning,
+    ConvNoCalib(bool),
     BenchCloseRunning,
 }
 
@@ -572,6 +574,7 @@ impl App {
         }
         self.quant_poll();
         self.conv_poll();
+        self.cal_poll();
         self.bench_poll();
         self.run_timers();
     }
@@ -597,11 +600,13 @@ impl App {
     }
 
     fn close_stage2(&mut self) {
-        if self.quant.proc.is_some() || self.conv.proc.is_some() || self.bench.busy() {
+        if self.quant.proc.is_some() || self.conv.proc.is_some() || self.conv.cal.busy() || self.bench.busy() {
             let what = if self.quant.proc.is_some() {
                 "An FP8 conversion"
             } else if self.conv.proc.is_some() {
                 "A Radiance conversion"
+            } else if self.conv.cal.busy() {
+                "A calibration (Hessians) run"
             } else {
                 "A BetterBench run"
             };
@@ -618,6 +623,7 @@ impl App {
         if self.conv.proc.is_some() {
             self.conv_stop();
         }
+        self.cal_stop();
         self.bench_stop();
         self.r_probe_kill_all();
         for p in 0..2 {
@@ -642,6 +648,12 @@ impl App {
                     self.fit_apply_plain(p, fallback, budget, auto, cap);
                 }
             }
+            Pending::LoadTreeI8(p) => {
+                if yes {
+                    self.panes[p].tree_i8_confirmed = true;
+                    self.load(p);
+                }
+            }
             Pending::LoadAnyway(p) => {
                 if yes {
                     self.panes[p].load_confirmed = true;
@@ -658,9 +670,15 @@ impl App {
                     let _ = std::fs::remove_file(f);
                 }
             }
+            Pending::ConvNoCalib(replace_ok) => {
+                if yes {
+                    self.conv_start_uncalibrated(replace_ok);
+                }
+            }
             Pending::ConvCloseRunning => match ans {
                 "yes" => {
                     self.conv_stop();
+                    self.cal_stop();
                     self.conv.visible = false;
                 }
                 "no" => self.conv.visible = false,
@@ -956,6 +974,7 @@ impl App {
                 "copyLog" => self.copy_log(p),
                 "saveLog" => self.save_log(p),
                 "showMetadata" => self.show_metadata(p),
+                "prefixCalc" => return self.prefix_calc(p),
                 _ => {}
             }
             return Value::Null;

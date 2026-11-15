@@ -150,9 +150,10 @@ pub struct Mon {
 }
 
 pub const BOOL_VARS: [&str; 6] = ["jinja", "relax_tpl", "dual_moe_spread", "eager", "text_only", "kquiet"];
-pub const ALL_VARS: [&str; 48] = [
+pub const ALL_VARS: [&str; 50] = [
     "ctx", "ngl", "fa", "kv", "n_cpu_moe", "parallel", "threads", "batch", "ubatch", "port", "jinja", "relax_tpl",
     "dual_strategy", "dual_mode", "dual_ts", "dual_first", "dual_moe_spread", "mmproj", "mtp", "mtp_n", "extra",
+    "cache_ram", "kv_offload",
     "gpu_util", "kv_dtype", "dtype", "max_batched", "cpu_offload", "eager", "text_only", "reasoning", "quant", "kbuild",
     // Radiance
     "r_kv", "r_batched", "r_headroom", "r_spec", "r_spec_ngram", "r_ngram_min", "r_ngram_max", "r_draft_window", "r_vision", "r_embed", "r_placement", "r_host_pool",
@@ -307,6 +308,8 @@ pub struct Pane {
     pub show_dual: bool,
     /// the user said "load anyway" to a red estimate
     pub load_confirmed: bool,
+    /// "load anyway" was answered for Radiance 2.0's tree-drafter + i8 crash, for the next Load
+    pub tree_i8_confirmed: bool,
     /// the estimate puts more on a card than the card holds (not merely "close to full")
     pub est_over: bool,
 }
@@ -442,6 +445,7 @@ impl Pane {
             dash_ready_t: None,
             show_dual: false,
             load_confirmed: false,
+            tree_i8_confirmed: false,
             est_over: false,
         }
     }
@@ -776,6 +780,8 @@ impl App {
         });
         if v.is_kobold() {
             o["kquiet"] = Value::Bool(v.var_b("kquiet"));
+        } else {
+            o["cache_ram"] = v.int("cache_ram", LLAMA_CACHE_RAM_DEFAULT).max(-1).into();
         }
         o.as_object().unwrap().clone()
     }
@@ -801,6 +807,8 @@ impl App {
         o.insert("parallel".into(), v.int("parallel", 1).max(1).into());
         o.insert("max_batched".into(), v.int("max_batched", 0).max(0).into());
         o.insert("cpu_offload".into(), if co.fract() == 0.0 { json!(co as i64) } else { json!(co) });
+        let ko = round3(v.float("kv_offload", 0.0).max(0.0));
+        o.insert("kv_offload".into(), if ko.fract() == 0.0 { json!(ko as i64) } else { json!(ko) });
         o.insert("eager".into(), v.var_b("eager").into());
         o.insert("text_only".into(), v.var_b("text_only").into());
         o.insert("reasoning".into(), Value::from(if reasoning.is_empty() { "(none)".to_string() } else { reasoning }));

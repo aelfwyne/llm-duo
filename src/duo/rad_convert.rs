@@ -30,6 +30,12 @@ pub struct Conv {
     pub max_ctx: String,
     pub extra: String,
     pub env: String,
+    /// the calibration folder (RADGRAM2 Hessians) a GPTQ recipe reads as $CALIB
+    pub calib: String,
+    /// "start without calibration data" was confirmed for the next start
+    calib_confirmed: bool,
+    /// the Create-calibration panel and its run
+    pub cal: super::calib::Calib,
     pub plan_only: bool,
     /// what the Metadata box was last auto-filled with: it is replaced only while it still says that
     sets_auto: String,
@@ -70,6 +76,9 @@ impl Conv {
             max_ctx: String::new(),
             extra: String::new(),
             env: String::new(),
+            calib: String::new(),
+            calib_confirmed: false,
+            cal: super::calib::Calib::new(),
             plan_only: false,
             sets_auto: String::new(),
             set_note: String::new(),
@@ -115,6 +124,72 @@ fn dir_size(d: &std::path::Path) -> f64 {
     t
 }
 
+/// A short name for a drafter repository, for output file names, read from its config.json:
+/// "dflash2", "dflash", "dspark", "assistant", "eagle", else "draft".
+pub fn drafter_tag(path: &std::path::Path) -> String {
+    let dir = if path.is_file() { path.parent().unwrap_or(path) } else { path };
+    let cfg: Value = std::fs::read_to_string(dir.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+    let lc = |v: Option<&Value>| v.and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
+    let arch = cfg.get("architectures").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ").to_lowercase()).unwrap_or_default();
+    let mt = lc(cfg.get("model_type"));
+    let spec = lc(cfg.get("speculators_model_type"));
+    let name = dir.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let has = |k: &str| arch.contains(k) || mt.contains(k) || spec.contains(k);
+    if has("dflash2") {
+        "dflash2"
+    } else if has("dflash") || cfg.get("dflash_config").is_some() {
+        "dflash"
+    } else if has("dspark") {
+        "dspark"
+    } else if mt.ends_with("_assistant") || arch.contains("assistant") {
+        "assistant"
+    } else if has("eagle") {
+        "eagle"
+    } else if cfg.is_null() {
+        // no readable config: fall back on the folder's own name
+        if name.contains("dflash2") { "dflash2" } else if name.contains("dflash") { "dflash" } else if name.contains("dspark") { "dspark" } else if name.contains("assistant") { "assistant" } else { "draft" }
+    } else {
+        "draft"
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+mod drafter_tests {
+    use super::drafter_tag;
+
+    fn with_cfg(name: &str, cfg: &str) -> String {
+        let d = std::env::temp_dir().join(format!("llmduo-drafter-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        if !cfg.is_empty() {
+            std::fs::write(d.join("config.json"), cfg).unwrap();
+        }
+        let t = drafter_tag(&d);
+        let _ = std::fs::remove_dir_all(&d);
+        t
+    }
+
+    #[test]
+    fn tags() {
+        // RedHatAI's speculators-format DFlash2 (Gemma 4 31B)
+        assert_eq!(with_cfg("a", r#"{"architectures":["DFlash2DraftModel"],"speculators_model_type":"dflash2"}"#), "dflash2");
+        // z-lab's DFlash2 (Qwen3.8): a qwen3 model_type with a dflash_config
+        assert_eq!(with_cfg("b", r#"{"model_type":"qwen3","architectures":["DFlash2DraftModel"],"dflash_config":{"block_size":8}}"#), "dflash2");
+        // z-lab's DFlash
+        assert_eq!(with_cfg("c", r#"{"model_type":"qwen3","architectures":["DFlashDraftModel"],"dflash_config":{"block_size":16}}"#), "dflash");
+        assert_eq!(with_cfg("d", r#"{"model_type":"gemma4_assistant","architectures":["Gemma4AssistantForCausalLM"]}"#), "assistant");
+        assert_eq!(with_cfg("e", r#"{"architectures":["DSparkModel"]}"#), "dspark");
+        assert_eq!(with_cfg("f", r#"{"architectures":["SomethingElse"]}"#), "draft");
+        assert_eq!(with_cfg("my-dflash2-drafter", ""), "dflash2");
+    }
+}
+
+/// The empty folder a plan-only run gets as $CALIB when no calibration data is set.
+fn plan_calib_placeholder() -> PathBuf {
+    dirs().data.join("calib-plan-placeholder")
+}
+
 fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect()
 }
@@ -128,21 +203,99 @@ impl App {
         let c = &self.conv;
         let mut names = vec![NO_RECIPE.to_string()];
         names.extend(c.recipes.iter().map(|r| r.name.clone()));
+        // what the dropdown shows: a recipe that needs calibration Hessians says so in the list
+        let mut labels = vec![NO_RECIPE.to_string()];
+        labels.extend(c.recipes.iter().map(|r| {
+            if recipe_needs_calib(&r.text) { format!("{}   ⚠ needs Hessians (CALIB)", r.name) } else { r.name.clone() }
+        }));
         json!({
-            "visible": c.visible, "sources": c.sources, "recipes": names, "src": c.src, "recipe": c.recipe,
+            "visible": c.visible, "sources": c.sources, "recipes": names, "recipeLabels": labels, "src": c.src, "recipe": c.recipe,
             "out": c.out, "sets": c.sets, "draft": c.draft, "maxCtx": c.max_ctx, "extra": c.extra, "env": c.env,
             "planOnly": c.plan_only, "info": c.info, "about": c.about, "status": c.status, "running": c.proc.is_some(),
             "outRoot": self.conv_out_root().display().to_string(),
             "setNote": c.set_note, "hint": c.hint, "fixSets": c.fix_sets.clone().unwrap_or_default(),
             "gpus": self.conv_gpu_choices(), "gpu": c.gpu,
             "recipesDir": gs(self.settings.g(), "radiance_recipes_dir", ""),
+            "needsCalib": self.conv_needs_calib(), "calib": c.calib, "calibStatus": self.conv_calib_status().1,
+            "calibOk": self.conv_calib_status().0, "calibWhy": self.conv_calib_why(),
+            "cal": {
+                "shown": c.cal.shown, "src": c.cal.src, "corpus": c.cal.corpus, "out": c.cal.out, "gpu": c.cal.gpu,
+                "gpus": self.cal_gpu_choices(), "maxLen": c.cal.max_len, "keepRaw": c.cal.keep_raw,
+                "running": c.cal.busy(), "status": c.cal.status, "info": self.cal_info(),
+            },
         })
     }
 
+    /// The selected recipe reads `$CALIB` (GPTQ against calibration Hessians).
+    pub fn conv_needs_calib(&self) -> bool {
+        self.conv.recipes.iter().find(|r| r.name == self.conv.recipe).is_some_and(|r| recipe_needs_calib(&r.text))
+    }
+
+    /// The calibration folder rad-convert will read: Environment's CALIB=, else the field.
+    fn conv_calib_dir(&self) -> Option<PathBuf> {
+        let from_env = shlex_split(&self.conv.env).unwrap_or_default().into_iter().find_map(|p| p.strip_prefix("CALIB=").map(String::from));
+        let d = from_env.unwrap_or_else(|| self.conv.calib.clone());
+        let d = d.trim();
+        if d.is_empty() { None } else { Some(expanduser(d)) }
+    }
+
+    /// (usable, what the calibration folder holds).
+    fn conv_calib_status(&self) -> (bool, String) {
+        let Some(d) = self.conv_calib_dir() else { return (false, "no calibration folder set".into()) };
+        if !d.is_dir() {
+            return (false, format!("{} does not exist", d.display()));
+        }
+        match super::calib::grams_in(&d) {
+            (0, 0) => (false, "no Hessian files (gram.r*.bin) in that folder".into()),
+            (0, r) => (false, format!("{r} raw calibration files but no gram.r*.bin - point it at the grams/ folder of a finished run")),
+            (g, _) => (true, format!("✓ {g} Hessian files")),
+        }
+    }
+
+    /// Why Create Hessians can't run for the Convert source (empty: it can).
+    fn conv_calib_why(&self) -> String {
+        if self.conv.src.is_empty() {
+            return String::new();
+        }
+        super::calib::unsupported(&PathBuf::from(&self.conv.src)).unwrap_or_default()
+    }
+
+    /// The alert when a GPTQ recipe is picked without calibration data.
+    fn conv_calib_alert(&mut self) {
+        if !self.conv_needs_calib() || self.conv_calib_status().0 {
+            return;
+        }
+        let why = self.conv_calib_why();
+        let how = if why.is_empty() {
+            "LLM Duo can record them: press \"Create Hessians…\" in the Convert window. That serves the bf16 checkpoint with Radiance's calibration mode over a text corpus (an hour or more, and the bf16 weights must fit your cards), then writes the files rad-convert reads."
+                .to_string()
+        } else {
+            format!("LLM Duo can't record them for this checkpoint: {why}.")
+        };
+        self.msg(
+            "warning",
+            &format!(
+                "The recipe \"{}\" is fitted by GPTQ against calibration Hessians: the statistics of every layer's input over a text corpus (CALIB).\n\n\
+                 Without them rad-convert quantises those weights uncalibrated, which gives a worse model than the recipe's published numbers.\n\n\
+                 If you already have them, set \"Calibration data\" to their folder.\n\n{how}\n\n\
+                 Without calibration data, a round-to-nearest recipe (e.g. q38-27b-iq8r-rtn) needs none.",
+                self.conv.recipe
+            ),
+        );
+    }
+
+    pub fn conv_log_pub(&mut self, line: &str) {
+        self.conv_log(line);
+    }
+
     pub fn conv_show(&mut self) {
+        let was = self.conv.visible;
         self.conv.visible = true;
         if self.conv.proc.is_none() {
             self.conv_refresh();
+        }
+        if !was {
+            self.conv_calib_alert();
         }
     }
 
@@ -196,7 +349,9 @@ impl App {
         self.conv.fix_sets = None;
         self.conv_auto_sets();
         self.conv_default_out();
+        self.conv.calib_confirmed = false;
         self.conv_update_info();
+        self.conv_calib_alert();
     }
 
     /// What the Metadata (--set) box should hold for this checkpoint and recipe, and why:
@@ -281,7 +436,8 @@ impl App {
             tag = format!("-{}", if t.is_empty() { r.name.clone() } else { t });
         }
         if !self.conv.draft.trim().is_empty() {
-            tag += "-mtp";
+            // what the merged drafter is (dflash2, dflash, assistant, …), not a blanket "-mtp"
+            tag += &format!("-{}", drafter_tag(&expanduser(self.conv.draft.trim())));
         }
         self.conv.out = sanitize(&format!("{name}{tag}")) + ".rad";
         self.conv.out_auto = self.conv.out.clone();
@@ -345,8 +501,8 @@ impl App {
             parts.push("no recipe: bf16 / f16 / block-fp8 weights are kept as they are".into());
         }
         let recipe = self.conv.recipes.iter().find(|r| r.name == self.conv.recipe);
-        if recipe.is_some_and(|r| recipe_needs_calib(&r.text)) && !self.conv.env.contains("CALIB=") && std::env::var_os("CALIB").is_none() {
-            parts.push("⚠ this recipe reads calibration data: set CALIB=<dir> in Environment".into());
+        if recipe.is_some_and(|r| recipe_needs_calib(&r.text)) && !self.conv_calib_status().0 {
+            parts.push("⚠ this recipe needs calibration Hessians: set Calibration data, or Create Hessians…".into());
         }
         if recipe.is_some_and(|r| recipe_needs_repo_cwd(&r.text) && repo_of_recipe(&r.path).is_none()) {
             parts.push("⚠ this recipe reads data/codebooks/… and that folder isn't beside the recipes folder".into());
@@ -424,17 +580,66 @@ impl App {
         if let Some(i) = self.conv_gpu_env() {
             set("HIP_VISIBLE_DEVICES".into(), i);
         }
+        if !c.calib.trim().is_empty() {
+            set("CALIB".into(), abs(expanduser(c.calib.trim())));
+        }
         for part in shlex_split(&c.env)? {
             match part.split_once('=') {
                 Some((k, v)) if !k.is_empty() => set(k.into(), v.into()),
                 _ => return Err(format!("'{part}' in Environment is not KEY=VALUE")),
             }
         }
+        // a plan reads no Hessians, but rad-convert refuses a recipe whose $CALIB is unset:
+        // give it an empty folder so the plan can be checked before any calibration exists
+        if c.plan_only && c.calib_confirmed && self.conv_needs_calib() && !env.iter().any(|e| e.0 == "CALIB" && !e.1.trim().is_empty()) {
+            let ph = plan_calib_placeholder();
+            let _ = std::fs::create_dir_all(&ph);
+            env.push(("CALIB".into(), ph.to_string_lossy().into_owned()));
+        }
         Ok((cmd, env))
     }
 
     pub fn conv_start(&mut self, replace_ok: bool) {
         if self.conv.proc.is_some() {
+            return;
+        }
+        if self.conv.cal.busy() {
+            self.msg("info", "Hessians are being recorded - wait for that run (or stop it) before converting.");
+            return;
+        }
+        if self.conv_needs_calib() && !self.conv_calib_status().0 && !self.conv.calib_confirmed {
+            let status = self.conv_calib_status().1;
+            let recipe = self.conv.recipe.clone();
+            if self.conv.plan_only {
+                self.ask(
+                    &format!(
+                        "HESSIANS NEEDED: the recipe \"{recipe}\" is fitted by GPTQ against calibration Hessians, and none are set ({status}).\n\n\
+                         A plan check reads no Hessians, so it can run with an empty stand-in folder as CALIB. \
+                         Converting for real will still need them: set Calibration data, or Create Hessians….\n\n\
+                         Check the plan with an empty stand-in for CALIB?"
+                    ),
+                    "yesno",
+                    Pending::ConvNoCalib(replace_ok),
+                );
+            } else if self.conv_calib_dir().is_none() {
+                self.msg(
+                    "warning",
+                    &format!(
+                        "HESSIANS NEEDED: the recipe \"{recipe}\" is fitted by GPTQ against calibration Hessians, and no calibration data is set.\n\n\
+                         rad-convert cannot run this recipe without them. Set Calibration data to a folder of gram.r*.bin files, \
+                         or press Create Hessians… to record them (dense Qwen3.5/3.8 only). A round-to-nearest recipe needs none."
+                    ),
+                );
+            } else {
+                self.ask(
+                    &format!(
+                        "HESSIANS MISSING: the recipe \"{recipe}\" is fitted by GPTQ against calibration Hessians, but the Calibration data folder doesn't hold them:\n{status}\n\n\
+                         Converting anyway quantises every weight without a Hessian UNCALIBRATED (a worse model than the recipe's numbers).\n\nConvert anyway?"
+                    ),
+                    "yesno",
+                    Pending::ConvNoCalib(replace_ok),
+                );
+            }
             return;
         }
         let (cmd, env) = match self.conv_command() {
@@ -460,9 +665,14 @@ impl App {
         self.push_event(json!({"type": "logClear", "side": "convert"}));
         self.conv.lines.clear();
         let hip = env.iter().find(|e| e.0 == "HIP_VISIBLE_DEVICES").map(|e| format!("HIP_VISIBLE_DEVICES={} ", e.1)).unwrap_or_default();
+        let ph = plan_calib_placeholder().to_string_lossy().into_owned();
+        let calib = env.iter().find(|e| e.0 == "CALIB").map(|e| format!("CALIB={} ", shlex_quote(&e.1))).unwrap_or_default();
+        if self.conv.plan_only && env.iter().any(|e| e.0 == "CALIB" && e.1 == ph) {
+            self.conv_log("[LLM Duo] HESSIANS NEEDED: this recipe needs calibration Hessians and none are set. As you confirmed, this plan check runs with CALIB = an empty stand-in folder; a real convert needs the Hessians");
+        }
         let cwd = self.conv_cwd();
         let cd = cwd.as_ref().map(|d| format!("cd {} && ", shlex_quote(&d.to_string_lossy()))).unwrap_or_default();
-        self.conv_log(&format!("$ {cd}{hip}{}", shlex_join(&cmd)));
+        self.conv_log(&format!("$ {cd}{calib}{hip}{}", shlex_join(&cmd)));
         while self.conv.rx.try_recv().is_ok() {}
         match proc::spawn_in(&cmd, &env, false, cwd.as_deref(), self.conv.tx.clone()) {
             Ok(pr) => self.conv.proc = Some(pr),
@@ -471,6 +681,7 @@ impl App {
                 return;
             }
         }
+        self.conv.calib_confirmed = false;
         self.conv.out_path = target;
         self.conv.t0 = Some(Instant::now());
         self.conv.status = if self.conv.plan_only { "Planning…".into() } else { "Converting…".into() };
@@ -484,6 +695,12 @@ impl App {
         self.push_event(json!({"type": "log", "side": "convert", "text": line}));
     }
 
+    /// Confirmed: start without calibration data.
+    pub fn conv_start_uncalibrated(&mut self, replace_ok: bool) {
+        self.conv.calib_confirmed = true;
+        self.conv_start(replace_ok);
+    }
+
     pub fn conv_stop(&mut self) {
         let Some(pr) = &self.conv.proc else { return };
         self.conv.user_stopped = true;
@@ -492,7 +709,7 @@ impl App {
     }
 
     pub fn conv_close(&mut self) {
-        if self.conv.proc.is_some() {
+        if self.conv.proc.is_some() || self.conv.cal.busy() {
             self.ask(
                 "A conversion is running.\n\nYes: stop it\nNo: keep it running in the background (reopen with Convert… in the top bar)",
                 "yesnocancel",
@@ -606,6 +823,20 @@ impl App {
                 self.conv_update_info();
             }
             "start" => self.conv_start(false),
+            "setCalib" => {
+                self.conv.calib = v.to_string();
+                self.conv_update_info();
+            }
+            "calShow" => self.cal_show(),
+            "calHide" => self.conv.cal.shown = false,
+            "calSetSrc" => self.cal_set_src(v),
+            "calSetCorpus" => self.conv.cal.corpus = v.to_string(),
+            "calSetOut" => self.conv.cal.out = v.to_string(),
+            "calSetGpu" => self.conv.cal.gpu = v.to_string(),
+            "calSetMaxLen" => self.conv.cal.max_len = v.to_string(),
+            "calSetKeepRaw" => self.conv.cal.keep_raw = v == "true",
+            "calStart" => self.cal_start(),
+            "calStop" => self.cal_stop(),
             "stop" => self.conv_stop(),
             "hide" => self.conv.visible = false,
             "close" => self.conv_close(),

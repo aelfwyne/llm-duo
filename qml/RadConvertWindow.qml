@@ -11,7 +11,7 @@ QQC2.ApplicationWindow {
     id: win
     title: "LLM Duo: convert for Radiance"
     width: Kirigami.Units.gridUnit * 52
-    height: Kirigami.Units.gridUnit * 40
+    height: Kirigami.Units.gridUnit * 46
 
     property var help: ({})
     property var c: ({})
@@ -46,6 +46,27 @@ QQC2.ApplicationWindow {
     FolderDialog {
         id: draftDialog
         onAccepted: { draftField.text = win.toPath(selectedFolder); win.call("setDraft", draftField.text) }
+    }
+    FolderDialog {
+        id: calibDialog
+        onAccepted: win.call("setCalib", win.toPath(selectedFolder))
+    }
+    FolderDialog {
+        id: calSrcDialog
+        onAccepted: win.call("calSetSrc", win.toPath(selectedFolder))
+    }
+    FileDialog {
+        id: calCorpusFile
+        nameFilters: ["JSON lines (*.jsonl)", "Text (*.txt *.md)", "All files (*)"]
+        onAccepted: win.call("calSetCorpus", win.toPath(selectedFile))
+    }
+    FolderDialog {
+        id: calCorpusDir
+        onAccepted: win.call("calSetCorpus", win.toPath(selectedFolder))
+    }
+    FolderDialog {
+        id: calOutDialog
+        onAccepted: win.call("calSetOut", win.toPath(selectedFolder))
     }
 
     // a text field that sends its value on every edit, and follows the backend otherwise
@@ -122,17 +143,21 @@ QQC2.ApplicationWindow {
                     property var items: []
                     property string sig: ""
                     property var src: win.c.recipes || []
+                    // the labels mark the recipes that need calibration Hessians
+                    property var labels: []
                     function sync() {
-                        const s = JSON.stringify(src)
+                        const s = JSON.stringify(src) + JSON.stringify(win.c.recipeLabels || [])
                         if (s !== sig) {
                             sig = s
                             items = src.slice()
+                            labels = (win.c.recipeLabels && win.c.recipeLabels.length === src.length) ? win.c.recipeLabels.slice() : src.slice()
                             currentIndex = Qt.binding(function () { return recipeBox.items.indexOf(win.c.recipe || "") })
                         }
                     }
                     onSrcChanged: sync()
+                    Connections { target: win; function onCChanged() { recipeBox.sync() } }
                     Component.onCompleted: sync()
-                    model: items
+                    model: labels
                     currentIndex: items.indexOf(win.c.recipe || "")
                     onActivated: function (i) { win.call("setRecipe", items[i]) }
                     HelpTip { text: win.h("c_recipe"); shown: recipeBox.hovered && !recipeBox.popup.visible }
@@ -154,6 +179,58 @@ QQC2.ApplicationWindow {
                 wrapMode: Text.Wrap
                 font: Kirigami.Theme.smallFont
                 color: Kirigami.Theme.disabledTextColor
+            }
+            Item { visible: !!win.c.needsCalib; Layout.preferredWidth: 1 }
+            Rectangle {
+                visible: !!win.c.needsCalib
+                Layout.fillWidth: true
+                implicitHeight: calibCol.implicitHeight + Kirigami.Units.largeSpacing * 2
+                radius: Kirigami.Units.cornerRadius
+                readonly property color tone: win.c.calibOk ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.neutralTextColor
+                color: Qt.rgba(tone.r, tone.g, tone.b, 0.12)
+                border.color: tone
+                ColumnLayout {
+                    id: calibCol
+                    anchors.fill: parent
+                    anchors.margins: Kirigami.Units.largeSpacing
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Kirigami.Icon {
+                            source: win.c.calibOk ? "dialog-ok" : "dialog-warning"
+                            Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
+                            Layout.preferredHeight: Layout.preferredWidth
+                        }
+                        QQC2.Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.Wrap
+                            text: win.c.calibOk
+                                ? "This recipe is fitted by GPTQ against calibration Hessians - set below."
+                                : "This recipe is fitted by GPTQ and needs calibration Hessians (CALIB). Without them its weights are quantised uncalibrated, a worse model than the recipe's numbers."
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QQC2.Label { text: "Calibration data" }
+                        BoundField { action: "setCalib"; value: win.c.calib || ""; help: win.h("c_calib"); enabled: !win.c.running
+                            placeholderText: "folder of gram.r*.bin Hessian files" }
+                        QQC2.Button { text: "Browse…"; icon.name: "document-open-folder"; enabled: !win.c.running; onClicked: calibDialog.open() }
+                        QQC2.Button {
+                            id: createBtn
+                            text: "Create Hessians…"
+                            icon.name: "run-build"
+                            enabled: !win.c.running
+                            onClicked: win.call("calShow")
+                            HelpTip { text: win.c.calibWhy ? ("Not for this checkpoint: " + win.c.calibWhy) : win.h("c_calcreate"); shown: createBtn.hovered }
+                        }
+                    }
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        font: Kirigami.Theme.smallFont
+                        color: win.c.calibOk ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.disabledTextColor
+                        text: win.c.calibStatus || ""
+                    }
+                }
             }
             OptLabel { text: "Output"; help: win.h("c_output") }
             BoundField { action: "setOut"; value: win.c.out || ""; help: win.h("c_output"); enabled: !win.c.running }
@@ -181,7 +258,7 @@ QQC2.ApplicationWindow {
                 placeholderText: "optional (default: the checkpoint's training context)" }
             OptLabel { text: "Environment"; help: win.h("c_env") }
             BoundField { action: "setEnv"; value: win.c.env || ""; help: win.h("c_env"); enabled: !win.c.running
-                placeholderText: "optional: CALIB=/path/to/grams … (for recipes that read $CALIB)" }
+                placeholderText: "optional: KEY=VALUE … (CALIB= here overrides Calibration data)" }
             OptLabel { text: "Extra args"; help: win.h("c_extra") }
             BoundField { action: "setExtra"; value: win.c.extra || ""; help: win.h("c_extra"); enabled: !win.c.running
                 placeholderText: "e.g. --imatrix FILE  --quant 'PATTERN=QUANTISER:k=v'  --reuse OLD.rad" }
@@ -207,6 +284,88 @@ QQC2.ApplicationWindow {
                 currentIndex: items.indexOf(win.c.gpu || "(auto)")
                 onActivated: function (i) { win.call("setGpu", items[i]) }
                 HelpTip { text: win.h("c_gpu"); shown: gpuBox.hovered && !gpuBox.popup.visible }
+            }
+        }
+        Kirigami.AbstractCard {
+            id: calPanel
+            Layout.fillWidth: true
+            visible: !!(win.c.cal && win.c.cal.shown)
+            readonly property var k: win.c.cal || ({})
+            contentItem: ColumnLayout {
+                RowLayout {
+                    Layout.fillWidth: true
+                    Kirigami.Heading { level: 4; text: "Create calibration Hessians"; Layout.fillWidth: true }
+                    QQC2.ToolButton { icon.name: "window-close"; enabled: !calPanel.k.running; onClicked: win.call("calHide")
+                        QQC2.ToolTip.visible: hovered; QQC2.ToolTip.text: "Hide this panel" }
+                }
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    font: Kirigami.Theme.smallFont
+                    color: Kirigami.Theme.disabledTextColor
+                    text: "Serves the bf16 checkpoint with Radiance's calibration mode over a text corpus, recording every layer's input statistics, "
+                        + "then writes them as the files rad-convert reads and sets Calibration data. Dense Qwen3.5 / Qwen3.8 only. "
+                        + "The bf16 weights must fit the cards chosen (the 27B needs two 32 GB cards); it takes an hour or more, and the cards are busy meanwhile."
+                }
+                GridLayout {
+                    Layout.fillWidth: true
+                    columns: 2
+                    enabled: !calPanel.k.running
+                    OptLabel { text: "bf16 checkpoint"; help: win.h("c_calsrc") }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        BoundField { action: "calSetSrc"; value: calPanel.k.src || ""; help: win.h("c_calsrc"); placeholderText: "the model the recipe will quantise, at bf16" }
+                        QQC2.Button { text: "Browse…"; icon.name: "document-open-folder"; onClicked: calSrcDialog.open() }
+                    }
+                    OptLabel { text: "Corpus"; help: win.h("c_calcorpus") }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        BoundField { action: "calSetCorpus"; value: calPanel.k.corpus || ""; help: win.h("c_calcorpus"); placeholderText: ".jsonl file, or a folder of .txt / .md / .jsonl files" }
+                        QQC2.Button { text: "File…"; icon.name: "document-open"; onClicked: calCorpusFile.open() }
+                        QQC2.Button { text: "Folder…"; icon.name: "document-open-folder"; onClicked: calCorpusDir.open() }
+                    }
+                    OptLabel { text: "Output folder"; help: win.h("c_calout") }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        BoundField { action: "calSetOut"; value: calPanel.k.out || ""; help: win.h("c_calout") }
+                        QQC2.Button { text: "Browse…"; icon.name: "document-open-folder"; onClicked: calOutDialog.open() }
+                    }
+                    OptLabel { text: "Cards"; help: win.h("c_calgpu") }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QQC2.ComboBox {
+                            id: calGpuBox
+                            Layout.fillWidth: true
+                            model: calPanel.k.gpus || []
+                            currentIndex: (calPanel.k.gpus || []).indexOf(calPanel.k.gpu || "all cards")
+                            onActivated: function (i) { win.call("calSetGpu", (calPanel.k.gpus || [])[i]) }
+                            HelpTip { text: win.h("c_calgpu"); shown: calGpuBox.hovered && !calGpuBox.popup.visible }
+                        }
+                        QQC2.Label { text: "Max tokens per document" }
+                        BoundField { action: "calSetMaxLen"; value: calPanel.k.maxLen || ""; help: win.h("c_calmaxlen"); Layout.fillWidth: false; Layout.preferredWidth: Kirigami.Units.gridUnit * 6 }
+                    }
+                    Item { Layout.preferredWidth: 1 }
+                    QQC2.CheckBox {
+                        id: keepRawBox
+                        text: "Keep the raw recordings after converting"
+                        checked: !!calPanel.k.keepRaw
+                        onToggled: win.call("calSetKeepRaw", checked ? "true" : "false")
+                        HelpTip { text: win.h("c_calkeep"); shown: keepRawBox.hovered }
+                    }
+                }
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: calPanel.k.info || ""
+                    color: (calPanel.k.info || "").indexOf("⚠") >= 0 ? Kirigami.Theme.neutralTextColor : Kirigami.Theme.disabledTextColor
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    QQC2.Button { text: "Create"; icon.name: "media-playback-start"; enabled: !calPanel.k.running && !win.c.running; onClicked: win.call("calStart") }
+                    QQC2.Button { text: "Stop"; icon.name: "media-playback-stop"; enabled: !!calPanel.k.running; onClicked: win.call("calStop") }
+                    QQC2.BusyIndicator { running: !!calPanel.k.running; visible: running; Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium; Layout.preferredWidth: Layout.preferredHeight }
+                    QQC2.Label { Layout.fillWidth: true; text: calPanel.k.status || ""; elide: Text.ElideRight }
+                }
             }
         }
         Rectangle {
