@@ -240,9 +240,16 @@ cargo test     # needs the Qt dev packages too, since the crate links Qt
 
 ### 1.1.0
 
-Radiance 2.0 support.
+Radiance 2.0 support, BetterBench from a pane, and a fuller load history.
 
 Added:
+
+- *BetterBench…* next to *Open web UI*: runs `betterbench run` in the background against the
+  pane's endpoint and served model, with its options in a window, and opens the HTML report when
+  done. The API key goes in `BETTERBENCH_API_KEY`, not on the command line.
+- The history window lists every recorded load option (tooltips, the All configurations table and
+  the Details pane, with differences first), and *Restore these settings* saves a configuration's
+  options as the model's settings on the matching pane.
 
 - Radiance 2.0 launches: the flag list (Extra args included) becomes the YAML file 2.0 reads, via
   `rad-yaml`, and radiance starts with `--config`. Load, Fit's plan check and *Copy command* all
@@ -272,6 +279,9 @@ Changed:
 
 Fixed:
 
+- Identical GPUs are matched to their sysfs card through the KFD topology, so each pane reads its
+  own card's memory (before, on a system where HIP's device 0 is card1, the panes swapped).
+- A model's Context is kept when switching models; the typed value was saved against the new model.
 - Readiness on Radiance 2.0, which no longer logs "serving on".
 - Recipes whose codebooks are named by `tcq_lut=` (IQR-V2 to V4) run from the Radiance checkout.
 - Number boxes no longer rewrite the number while it is being typed.
