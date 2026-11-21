@@ -1,6 +1,6 @@
 [package]
 name = "llm-duo"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Run one llama-server, KoboldCpp, vLLM or Radiance server per GPU from a two-pane KDE Plasma (Qt 6 / Kirigami) GUI"
@@ -18,6 +18,8 @@ cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
 serde_json = "1"
 regex = "1"
 libc = "0.2"
+minijinja = { version = "3.1.0", features = ["json", "loop_controls", "preserve_order", "serde"] }
+minijinja-contrib = { version = "3.1.0", features = ["pycompat"] }
 
 [build-dependencies]
 cxx-qt-build = "0.10"

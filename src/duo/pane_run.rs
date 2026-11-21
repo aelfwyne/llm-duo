@@ -321,6 +321,10 @@ impl App {
         if self.panes[p].proc.is_some() {
             return;
         }
+        if self.fleet.proc.is_some() {
+            self.msg("info", "The fleet is running on both cards. Stop it in Fleet mode first.");
+            return;
+        }
         if self.panes[p].device.is_none() {
             self.msg("error", "No GPU assigned to this pane. Open Settings.");
             return;
@@ -330,8 +334,13 @@ impl App {
             return;
         }
         let g = self.settings.g().clone();
-        if self.panes[p].r_probe.is_some() {
+        if self.panes[p].r_probe.is_some() || self.panes[p].r_probe_next.is_some() {
             self.msg("info", "Fit is still asking Radiance for its memory plan - wait a moment (or press Fit again to cancel it).");
+            return;
+        }
+        if self.r_probe_releasing(p) {
+            // Radiance budgets only the VRAM free when it starts
+            self.msg("info", "Fit's plan check is still exiting and holds its VRAM - press Load again in a few seconds.");
             return;
         }
         if self.panes[p].is_rad() && !expanduser(&gs(&g, "radiance_bin", "")).is_file() {
@@ -494,7 +503,7 @@ impl App {
         // drain stale messages of an earlier run
         while self.panes[p].proc_rx.try_recv().is_ok() {}
         let tx = self.panes[p].proc_tx.clone();
-        match proc::spawn(&run_cmd, &env, pty, tx) {
+        match proc::spawn_server(&run_cmd, &env, pty, tx) {
             Ok(pr) => self.panes[p].proc = Some(pr),
             Err(e) => {
                 self.panes[p].proc = None;
@@ -731,8 +740,8 @@ impl App {
         if !new_lines.is_empty() {
             self.append_log_ui(p, &new_lines);
         }
-        if self.panes[p].r_probe.is_some() {
-            self.r_probe_poll(p);
+        if self.panes[p].r_probe.is_some() || self.panes[p].r_probe_dying.is_some() {
+            self.r_probe_tick(p);
         }
     }
 

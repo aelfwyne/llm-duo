@@ -41,6 +41,12 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#1a1205
 .quants .tag{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
 .quants .tag.hit{background:var(--accent);color:#1a1205}
 .more{display:block;margin:14px auto}
+.radfiles{display:flex;flex-direction:column;gap:4px;margin-top:8px}
+.rf{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12.5px}
+.rf code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:var(--chip);padding:1px 6px;border-radius:5px;word-break:break-all}
+.rf .tag{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
+.rf .tag.hit{background:var(--accent);color:#1a1205}
+.rf button{padding:1px 8px;font-size:11.5px;border-radius:6px}
 details{margin-top:4px;font-size:13px;color:var(--muted)}
 details code{background:var(--chip);padding:1px 5px;border-radius:4px}
 @media (max-width:600px){.controls input[type=text],.controls input[type=password]{width:120px}}
@@ -49,7 +55,7 @@ details code{background:var(--chip);padding:1px 5px;border-radius:4px}
 <body>
 <div class="wrap">
   <h1>HF Model Finder</h1>
-  <p class="sub">Type it the way you'd say it: <em>gemma 4 26b gguf</em>, <em>qwen3 coder 30b mlx 4bit</em>, <em>llama 3.1 8b q4_k_m by bartowski -abliterated</em></p>
+  <p class="sub">Type it the way you'd say it: <em>gemma 4 26b gguf</em>, <em>qwen3 coder 30b mlx 4bit</em>, <em>llama 3.1 8b q4_k_m by bartowski -abliterated</em>, <em>gemma 4 31b radiance w4a8 mtp</em>, <em>radiance containers</em></p>
 
   <form class="q" id="qform">
     <input id="q" type="text" placeholder="Show me Gemma 4 26B GGUF models only" autocomplete="off" autofocus>
@@ -62,9 +68,19 @@ details code{background:var(--chip);padding:1px 5px;border-radius:4px}
         <option value="">Any</option>
         <option>gguf</option><option>mlx</option><option>onnx</option><option>safetensors</option>
         <option>awq</option><option>gptq</option><option>exl2</option><option>exl3</option>
+        <option value="radiance">radiance (.rad)</option>
       </select>
     </label>
-    <label>Quant (e.g. Q4_K_M, Q8, 4bit)<input id="quant" type="text"></label>
+    <label>Quant (e.g. Q4_K_M, Q8, 4bit, fp8, w4a8)<input id="quant" type="text"></label>
+    <label>Drafter
+      <select id="drafter">
+        <option value="">Any</option>
+        <option value="mtp">MTP</option>
+        <option value="dflash">DFlash</option>
+        <option value="dflash2">DFlash2</option>
+        <option value="dspark">DSpark</option>
+      </select>
+    </label>
     <label>Author / org<input id="author" type="text" placeholder="unsloth"></label>
     <label>Exclude (comma sep.)<input id="exclude" type="text" placeholder="abliterated, uncensored"></label>
     <label>Min downloads<input id="mindl" type="number" min="0" step="10" value="0"></label>
@@ -97,6 +113,12 @@ details code{background:var(--chip);padding:1px 5px;border-radius:4px}
     Exclude words with <code>-word</code> or <code>not word</code>. Set an author with <code>by name</code> or <code>name/model</code>.
     Quant filters check the actual file names in the repo, so <code>q4_k_m</code> only shows repos that ship that file.</p>
     <p>Loose matching lets name words match inside other words (e.g. <code>gemma</code> also hits <code>medgemma</code>).</p>
+    <p><b>Radiance:</b> add <code>radiance</code> or <code>rad</code> to the query (or pick it under Format). Only repos that actually ship a
+    <code>.rad</code> container are shown, so vLLM-radiance wheels and plain safetensors uploads are skipped. <code>radiance</code> on its own lists every
+    container. Repos tagged <code>radiance</code> are searched first, then untagged repos matching the name, so a container someone forgot to tag still turns up.
+    Container quants: <code>fp8</code>, <code>bf16</code>, <code>mxfp4</code>, <code>w4a8</code>, <code>i8g</code>, <code>iq8r</code>, <code>iq4r</code>, <code>int4</code>/<code>int5</code>, <code>iq1_s</code>,
+    or a bit width like <code>4bit</code>. Drafters: <code>mtp</code>, <code>dflash</code>/<code>df</code>, <code>dflash2</code>/<code>df2</code>, <code>dspark</code>.
+    Each <code>.rad</code> file gets a <i>copy curl</i> button for a resumable download.</p>
     <label style="display:inline-flex;gap:6px;align-items:center">HF token (optional, for rate limits / gated repos)
       <input id="token" type="password" style="width:220px;font:inherit;padding:4px 8px;border-radius:7px;border:1px solid var(--border);background:var(--bg);color:var(--text)">
     </label>
@@ -113,9 +135,22 @@ const $ = id => document.getElementById(id);
 const API = 'https://huggingface.co/api/models';
 const STOP = new Set(('show me find get list all only models model the a an for with please search that are is in of give ' +
   'i want looking need versions version quantized quantised quants quant files file repos repo any which what some like ' +
-  'just can you to on from hugging face huggingface hf').split(' '));
-const FORMATS = ['gguf','mlx','onnx','safetensors','awq','gptq','exl2','exl3'];
-const QUANT_TOKEN = /^(?:ud-)?(?:i?q\d(?:_[a-z0-9]+)*|tq\d_\d|bf16|fp16|f16|f32|fp8|mxfp4|nvfp4|\d+-?bits?)$/;
+  'just can you to on from hugging face huggingface hf container containers').split(' '));
+const FORMATS = ['gguf','mlx','onnx','safetensors','awq','gptq','exl2','exl3','radiance'];
+const QUANT_TOKEN = /^(?:ud-)?(?:i?q\d(?:_[a-z0-9]+)*|iq\d+r|tq\d_\d|bf16|fp16|f16|f32|fp8|fp4|mxfp4|m2xfp4|nvfp4|w\d+a\d+|w\d|i8g|int\d+|\d+-?bits?)$/;
+const DRAFT_WORDS = { mtp: 'mtp', dflash: 'dflash', df: 'dflash', dflash2: 'dflash2', df2: 'dflash2', df2b16: 'dflash2', dspark: 'dspark' };
+// quant / drafter tokens found in Radiance container file names (e.g. qwen3.8-next-flash-fp8-iq4r-moe.rad, gemma4-31b-dense-w4a8-df2b16-qkv.rad)
+const RAD_Q_RE = /(?:^|[-._])(iq\d_[a-z]+|iq\d+r|m2xfp4|mxfp4|nvfp4|fp4|fp8|fp16|bf16|w\d+a\d+|w\d+|a\d|i8g|int\d+|q\d+|exl3|\d+(?:\.\d+)?bpw)(?=[-._]|$)/gi;
+const RAD_D_RE = /(?:^|[-._])(df2b16|dflash2|dflash|df2|df|mtp|dspark)(?=[-._]|$)/gi;
+function radBits(t) {
+  let m;
+  if (t === 'bf16' || t === 'fp16') return 16;
+  if (t === 'i8g') return 8;
+  if ((m = t.match(/^w(\d+)/))) return +m[1];
+  if ((m = t.match(/^iq(\d+)/))) return +m[1];
+  if ((m = t.match(/^(?:int|q|a|fp|mxfp|nvfp|m2xfp)(\d+)$/))) return +m[1];
+  return null;
+}
 const SIZE_TOKEN = /^e?\d+(?:\.\d+)?[bm]$/;
 const EXPAND = ['downloads','likes','lastModified','createdAt','tags','siblings','pipeline_tag','gated'];
 const PAGE = 60;
@@ -128,7 +163,7 @@ const html = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>
 
 /* ---------- query parsing ---------- */
 function parse(q) {
-  const out = { terms: [], size: '', format: '', quant: '', author: '', exclude: [] };
+  const out = { terms: [], size: '', format: '', quant: '', drafter: '', author: '', exclude: [] };
   const raw = q.trim().split(/\s+/).filter(Boolean);
   const toks = [];
   for (let i = 0; i < raw.length; i++) {
@@ -140,17 +175,21 @@ function parse(q) {
     if (m) { out.author = m[1]; continue; }
     if ((t === 'by' || t === 'from') && raw[i+1]) { out.author = raw[++i].toLowerCase().replace(/[^a-z0-9_.-]/g, ''); continue; }
     if (t.includes('/')) { const [a, ...r] = t.split('/'); if (a) out.author = a; t = r.join('/'); if (!t) continue; }
+    if (t === 'rad' || t === '.rad') { out.format = 'radiance'; continue; }
+    if (DRAFT_WORDS[t]) { out.drafter = DRAFT_WORDS[t]; continue; }
     if (QUANT_TOKEN.test(t) && !/^\d+$/.test(t)) { out.quant = t; continue; }
     for (const p of t.split(/[-_]+/)) {
       if (!p) continue;
       const mm = p.match(/^([a-z]{2,})(\d+(?:\.\d+)?)$/);       // gemma4 -> gemma 4
-      if (mm && !SIZE_TOKEN.test(p) && !QUANT_TOKEN.test(p)) toks.push(mm[1], mm[2]);
+      if (mm && !SIZE_TOKEN.test(p) && !QUANT_TOKEN.test(p) && !DRAFT_WORDS[p]) toks.push(mm[1], mm[2]);
       else toks.push(p);
     }
   }
   for (const t of toks) {
     if (STOP.has(t)) continue;
     if (FORMATS.includes(t)) { out.format = t; continue; }
+    if (t === 'rad') { out.format = 'radiance'; continue; }
+    if (DRAFT_WORDS[t]) { out.drafter = DRAFT_WORDS[t]; continue; }
     if (QUANT_TOKEN.test(t) && !/^\d/.test(t)) { out.quant = t; continue; }
     if (/^\d+-?bits?$/.test(t)) { out.quant = t; continue; }
     if (SIZE_TOKEN.test(t)) { out.size = t; continue; }
@@ -186,11 +225,15 @@ const QORDER =q => { const m = q.match(/(\d+)/); return (m ? +m[1] : 99) + (/^ud
 function modelInfo(m) {
   if (m._info) return m._info;
   const files = (m.siblings || []).map(s => s.rfilename);
-  const quants = new Set(), helpers = new Set();
+  const quants = new Set(), helpers = new Set(), drafters = new Set();
   for (const f of files) {
     if (!/\.gguf$/i.test(f)) continue;
     const h = f.match(HELPER_RE);
-    if (h) { helpers.add(HELPER_LABEL(h[2])); continue; }       // MTP heads, vision projectors, drafts, adapters…
+    if (h) {                                                     // MTP heads, vision projectors, drafts, adapters…
+      helpers.add(HELPER_LABEL(h[2]));
+      const w = h[2].toLowerCase(); if (w === 'mtp' || w === 'dflash') drafters.add(w);
+      continue;
+    }
     const base = f.split('/').pop().replace(/\.gguf$/i, '').replace(/-\d{5}-of-\d{5}$/i, '');
     let mm = base.match(QRE);
     // folder-style quants (e.g. Q4_K_M/model-00001-of-00002.gguf)
@@ -201,22 +244,62 @@ function modelInfo(m) {
   const name = id.split('/').pop();
   const tags = (m.tags || []).map(t => t.toLowerCase());
   const lname = id.toLowerCase();
+
+  // Radiance containers: one .rad file holds weights, tokenizer, chat template and any drafter
+  const radFiles = [];
+  for (const f of files) {
+    if (!/\.rad$/i.test(f)) continue;
+    const base = f.split('/').pop().replace(/\.rad$/i, '').toLowerCase();
+    const q = [...new Set([...base.matchAll(RAD_Q_RE)].map(x => x[1].toLowerCase()))];
+    const d = [...new Set([...base.matchAll(RAD_D_RE)].map(x => DRAFT_WORDS[x[1].toLowerCase()]))];
+    d.forEach(x => drafters.add(x));
+    radFiles.push({ file: f, label: q.join('+').toUpperCase(), toks: q });
+  }
+  const isRad = radFiles.length > 0;
+  if (isRad) {
+    for (const t of ['mtp', 'dflash', 'dflash2', 'dspark']) if (tags.includes(t)) drafters.add(t);
+    // label containers whose file name has no quant marker from the repo tags instead
+    const tagQ = tags.filter(t => /^(?:iq\d_[a-z]+|iq\d+r|m2xfp4|mxfp4|nvfp4|fp8|bf16|fp16|w\d+a\d+|i8g|int\d+|exl3)$/.test(t));
+    radFiles.forEach(r => { if (!r.toks.length && tagQ.length) { r.toks = tagQ; r.label = tagQ.join('+').toUpperCase(); } });
+  }
+  const recipes = files.filter(f => /\.recipe$/i.test(f)).length;
+
+  // for .rad repos, ignore awq/gptq/exl tags: they describe how the container was quantised, not a loadable format
+  const nr = !isRad;
   const fmt = {
     gguf: tags.includes('gguf') || /gguf/.test(lname) || files.some(f => /\.gguf$/i.test(f)),
     mlx: tags.includes('mlx') || /(^|[-_/])mlx/.test(lname),
     onnx: tags.includes('onnx') || files.some(f => /\.onnx$/i.test(f)),
     safetensors: tags.includes('safetensors') || files.some(f => /\.safetensors$/i.test(f)),
-    awq: tags.includes('awq') || /awq/.test(lname),
-    gptq: tags.includes('gptq') || /gptq/.test(lname),
-    exl2: tags.includes('exl2') || /exl2/.test(lname),
-    exl3: tags.includes('exl3') || /exl3/.test(lname),
+    awq: nr && (tags.includes('awq') || /awq/.test(lname)),
+    gptq: nr && (tags.includes('gptq') || /gptq/.test(lname)),
+    exl2: nr && (tags.includes('exl2') || /exl2/.test(lname)),
+    exl3: nr && (tags.includes('exl3') || /exl3/.test(lname)),
+    radiance: isRad,
   };
   const bits = (lname.match(/(\d+)[-_]?bits?(?![a-z])/) || [])[1];
-  return m._info = { id, name, author: id.includes('/') ? id.split('/')[0] : '', quants: [...quants].sort((a,b)=>QORDER(a)-QORDER(b)||a.localeCompare(b)), helpers: [...helpers], fmt, bits, files };
+  return m._info = { id, name, author: id.includes('/') ? id.split('/')[0] : '', quants: [...quants].sort((a,b)=>QORDER(a)-QORDER(b)||a.localeCompare(b)), helpers: [...helpers], fmt, bits, files, tags, radFiles, recipes, drafters: [...drafters] };
+}
+
+function radQuantMatch(info, q) {
+  const bitm = q.match(/^(\d+)-?bits?$/);
+  let hits;
+  if (bitm) {
+    const b = +bitm[1];
+    hits = info.radFiles.filter(r => r.toks.some(t => radBits(t) === b)).map(r => r.label);
+    if (hits.length) return [true, hits];
+    return [info.tags.includes(b + '-bit'), []];
+  }
+  const ql = q.toLowerCase();
+  hits = info.radFiles.filter(r => r.toks.includes(ql)).map(r => r.label);
+  if (hits.length) return [true, hits];
+  if (info.tags.includes(ql)) return [true, []];
+  return [false, null];
 }
 
 function quantMatch(info, q) {
   if (!q) return [true, null];
+  if (info.fmt.radiance) return radQuantMatch(info, q);
   const bitm = q.match(/^(\d+)-?bits?$/);
   if (bitm) {
     if (info.bits === bitm[1]) return [true, null];
@@ -233,9 +316,9 @@ function quantMatch(info, q) {
 }
 
 /* ---------- fetching ---------- */
-function buildSearches(p, author) {
+function buildSearches(p, author, tag) {
   const first = p.terms[0];
-  if (!first) return author ? [''] : null;
+  if (!first) return (author || tag === 'radiance') ? [''] : null;
   if (!first.v) return [first.w];
   const v = first.v, w = first.w;
   const set = new Set([w + '-' + v, w + v, w + '_' + v, w + ' ' + v]);
@@ -277,6 +360,7 @@ async function fetchSearch(search, author, tag, maxN, onProgress) {
 function applyParsedToControls(p) {
   if (p.format) $('format').value = p.format;
   if (p.quant) $('quant').value = p.quant;
+  if (p.drafter) $('drafter').value = p.drafter;
   if (p.author) $('author').value = p.author;
   if (p.exclude.length) {
     const cur = $('exclude').value.split(',').map(s => s.trim()).filter(Boolean);
@@ -293,19 +377,22 @@ async function search(fromQuery) {
   try { location.hash = encodeURIComponent(q); } catch (e) {}
   const author = $('author').value.trim().toLowerCase();
   const format = $('format').value;
-  const tag = ['gguf','mlx','onnx'].includes(format) ? format : '';
-  const searches = buildSearches(parsed, author);
+  const tag = ['gguf','mlx','onnx','radiance'].includes(format) ? format : '';
+  const searches = buildSearches(parsed, author, tag);
   renderInterp();
   if (!searches) { setStatus('Add a model name (e.g. "gemma 4") or an author to search.', true); $('results').innerHTML = ''; return; }
   const maxN = +$('maxn').value;
-  const key = JSON.stringify([searches, author, tag, maxN]);
+  let jobs = searches.map(s => ({ s, tag }));
+  // not every .rad uploader adds the "radiance" tag, so also scan untagged repos matching the name/author
+  if (tag === 'radiance' && (parsed.terms.length || author)) jobs = jobs.concat(searches.map(s => ({ s, tag: '' })));
+  const key = JSON.stringify([jobs, author, maxN]);
   lastSearches = searches;
   if (cache.key !== key) {
     setStatus('Querying Hugging Face…');
     $('results').innerHTML = '';
     let got = 0;
     try {
-      const lists = await Promise.all(searches.map(s => fetchSearch(s, author, tag, maxN, n => { got += n; setStatus('Fetched ' + got.toLocaleString() + ' candidate repos…'); })));
+      const lists = await Promise.all(jobs.map(j => fetchSearch(j.s, author, j.tag, maxN, n => { got += n; setStatus('Fetched ' + got.toLocaleString() + ' candidate repos…'); })));
       const seen = new Map();
       lists.flat().forEach(m => { const id = m.id || m.modelId; if (!seen.has(id)) seen.set(id, m); });
       cache = { key, models: [...seen.values()] };
@@ -324,6 +411,7 @@ function refilter() {
   const sRe = parsed.size ? sizeRe(parsed.size) : null;
   const format = $('format').value;
   const quant = $('quant').value.trim().toLowerCase();
+  const drafter = $('drafter').value;
   const author = $('author').value.trim().toLowerCase();
   const excl = $('exclude').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   const minDl = +$('mindl').value || 0;
@@ -337,6 +425,7 @@ function refilter() {
     if (!termRes.every(r => r.test(name))) continue;
     if (sRe && !sRe.test(name)) continue;
     if (format && !info.fmt[format]) continue;
+    if (drafter && !info.drafters.includes(drafter)) continue;
     if (excl.some(x => id.includes(x))) continue;
     const dl = m.downloads || 0;
     if (dl < minDl || (hideZero && dl === 0)) continue;
@@ -371,12 +460,27 @@ function renderMore() {
     const info = modelInfo(m);
     const fmts = Object.entries(info.fmt).filter(([k, v]) => v && k !== 'safetensors').map(([k]) => '<span class="badge">' + k + '</span>').join('');
     const hits = new Set(m._hits || []);
-    const qs = info.quants.length ? '<div class="quants">' + info.quants.map(q => '<span class="tag' + (hits.has(q) ? ' hit' : '') + '">' + html(q) + '</span>').join('') + '</div>' : '';
+    let qs = info.quants.length ? '<div class="quants">' + info.quants.map(q => '<span class="tag' + (hits.has(q) ? ' hit' : '') + '">' + html(q) + '</span>').join('') + '</div>' : '';
+    if (info.radFiles.length) {
+      qs += '<div class="radfiles">' + info.radFiles.map(r => {
+        const url = 'https://huggingface.co/' + info.id + '/resolve/main/' + r.file.split('/').map(encodeURIComponent).join('/');
+        const cmd = 'curl -LC - -O ' + (m.gated ? '-H "Authorization: Bearer $HF_TOKEN" ' : '') + url;
+        return '<div class="rf"><code>' + html(r.file) + '</code>' +
+          (r.label ? '<span class="tag' + (hits.has(r.label) ? ' hit' : '') + '">' + html(r.label) + '</span>' : '') +
+          '<button type="button" data-cmd="' + html(cmd) + '" title="' + html(cmd) + '">copy curl</button></div>';
+      }).join('') + '</div>';
+    }
+    const extra = info.fmt.radiance
+      ? info.drafters.map(d => '<span class="badge p" title="Drafter for speculative decoding">+' + html(d) + '</span>').join('') +
+        (info.tags.includes('vision') ? '<span class="badge p">+vision</span>' : '') +
+        (info.tags.includes('audio') ? '<span class="badge p">+audio</span>' : '') +
+        (info.recipes ? '<span class="badge p" title="rad-convert recipe included">+recipe</span>' : '')
+      : '';
     frag.push('<div class="card"><div class="top">' +
       '<a class="name" href="https://huggingface.co/' + html(info.id) + '" target="_blank" rel="noopener"><span>' + html(info.author) + '/</span>' + html(info.name) + '</a>' +
       fmts + (m.pipeline_tag ? '<span class="badge p">' + html(m.pipeline_tag) + '</span>' : '') +
       (m.gated ? '<span class="badge p">gated</span>' : '') +
-      info.helpers.map(h => '<span class="badge p" title="Extra helper file in this repo, not a model quant">+' + html(h) + '</span>').join('') +
+      info.helpers.map(h => '<span class="badge p" title="Extra helper file in this repo, not a model quant">+' + html(h) + '</span>').join('') + extra +
       '</div>' + qs +
       '<div class="meta"><span>↓ ' + num(m.downloads) + '</span><span>♥ ' + num(m.likes) + '</span>' +
       (m.lastModified ? '<span>updated ' + ago(m.lastModified) + '</span>' : '') +
@@ -395,13 +499,14 @@ function renderInterp() {
   if (parsed.size) t.push('<span class="tag"><b>size</b>' + html(parsed.size.toUpperCase()) + '</span>');
   if ($('format').value) t.push('<span class="tag"><b>format</b>' + html($('format').value) + '</span>');
   if ($('quant').value.trim()) t.push('<span class="tag"><b>quant</b>' + html($('quant').value.trim()) + '</span>');
+  if ($('drafter').value) t.push('<span class="tag"><b>drafter</b>' + html($('drafter').value) + '</span>');
   if ($('author').value.trim()) t.push('<span class="tag"><b>by</b>' + html($('author').value.trim()) + '</span>');
   $('exclude').value.split(',').map(s => s.trim()).filter(Boolean).forEach(x => t.push('<span class="tag x">−' + html(x) + '</span>'));
   $('interp').innerHTML = t.length ? 'Interpreted as: ' + t.join('') : '';
 }
 
 /* ---------- saved filters ---------- */
-const SAVED = ['format','quant','author','exclude','mindl','sort','maxn','loose','officialOnly'];
+const SAVED = ['format','quant','drafter','author','exclude','mindl','sort','maxn','loose','officialOnly'];
 const DEFAULTS = {};
 SAVED.forEach(id => { const el = $(id); DEFAULTS[id] = el.type === 'checkbox' ? el.checked : el.value; });
 function saveFilters() {
@@ -427,8 +532,20 @@ $('resetFilters').addEventListener('click', () => {
 $('qform').addEventListener('submit', e => { e.preventDefault(); search(true); });
 ['format','author','maxn'].forEach(id => $(id).addEventListener('change', () => parsed && search(false)));
 ['quant','exclude','mindl'].forEach(id => $(id).addEventListener('input', () => cache.key && refilter()));
-['sort','loose','officialOnly'].forEach(id => $(id).addEventListener('change', () => cache.key && refilter()));
+['sort','loose','officialOnly','drafter'].forEach(id => $(id).addEventListener('change', () => cache.key && refilter()));
 $('more').addEventListener('click', renderMore);
+$('results').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-cmd]');
+  if (!b) return;
+  const cmd = b.dataset.cmd;
+  let ok = false;
+  try { await navigator.clipboard.writeText(cmd); ok = true; } catch (err) {
+    const ta = document.createElement('textarea'); ta.value = cmd; document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand('copy'); } catch (e2) {} ta.remove();
+  }
+  if (!ok) { window.prompt('Copy this command:', cmd); return; }
+  const old = b.textContent; b.textContent = 'copied'; setTimeout(() => b.textContent = old, 1200);
+});
 $('token').addEventListener('change', () => { try { localStorage.setItem('hfToken', $('token').value); } catch (e) {} });
 try { $('token').value = localStorage.getItem('hfToken') || ''; } catch (e) {}
 

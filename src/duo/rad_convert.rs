@@ -11,8 +11,8 @@ use std::time::Instant;
 use super::app::{App, Pending};
 use super::proc::{self, Proc, ProcMsg};
 use super::radiance::{
-    bf16_plugin_mismatch, checkpoint_kind, decision_kind, known_sets, list_recipes, recipe_kind, recipe_needs_calib, recipe_needs_repo_cwd,
-    recipe_sets, repo_of_recipe, scan_laya, sets_text, tool_path, Recipe,
+    bf16_plugin_mismatch, checkpoint_kind, decision_kind, known_sets, list_recipes, recipe_calib_to_env, recipe_fixed_calib, recipe_kind,
+    recipe_needs_calib, recipe_needs_repo_cwd, recipe_source, RecipeSource, recipe_sets, repo_of_recipe, scan_laya, sets_text, tool_path, Recipe,
 };
 use super::util::*;
 
@@ -34,6 +34,9 @@ pub struct Conv {
     pub calib: String,
     /// "start without calibration data" was confirmed for the next start
     calib_confirmed: bool,
+    /// for a recipe with a fixed `calib=` folder, answered for the next start: Some(true) runs a
+    /// copy that reads Calibration data ($CALIB), Some(false) the recipe as it is
+    calib_copy: Option<bool>,
     /// the Create-calibration panel and its run
     pub cal: super::calib::Calib,
     pub plan_only: bool,
@@ -78,6 +81,7 @@ impl Conv {
             env: String::new(),
             calib: String::new(),
             calib_confirmed: false,
+            calib_copy: None,
             cal: super::calib::Calib::new(),
             plan_only: false,
             sets_auto: String::new(),
@@ -122,6 +126,22 @@ fn dir_size(d: &std::path::Path) -> f64 {
         }
     }
     t
+}
+
+/// The output name's stem for a checkpoint: a folder's name, a single file's name without
+/// .safetensors / .gguf, or for an index.json (model.safetensors.index.json) its folder's name.
+fn src_base_name(p: &std::path::Path) -> String {
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let lc = name.to_lowercase();
+    if lc.ends_with(".json") {
+        return p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
+    }
+    for ext in [".safetensors", ".gguf"] {
+        if lc.ends_with(ext) && name.len() > ext.len() {
+            return name[..name.len() - ext.len()].to_string();
+        }
+    }
+    name
 }
 
 /// A short name for a drafter repository, for output file names, read from its config.json:
@@ -185,6 +205,11 @@ mod drafter_tests {
     }
 }
 
+/// Where the copy of a recipe with a fixed `calib=` folder is written, reading $CALIB instead.
+fn calib_copy_path(name: &str) -> PathBuf {
+    dirs().data.join("recipe-copies").join(format!("{}.calib-env.recipe", sanitize(name)))
+}
+
 /// The empty folder a plan-only run gets as $CALIB when no calibration data is set.
 fn plan_calib_placeholder() -> PathBuf {
     dirs().data.join("calib-plan-placeholder")
@@ -206,7 +231,11 @@ impl App {
         // what the dropdown shows: a recipe that needs calibration Hessians says so in the list
         let mut labels = vec![NO_RECIPE.to_string()];
         labels.extend(c.recipes.iter().map(|r| {
-            if recipe_needs_calib(&r.text) { format!("{}   ⚠ needs Hessians (CALIB)", r.name) } else { r.name.clone() }
+            match (recipe_needs_calib(&r.text), recipe_fixed_calib(&r.text)) {
+                (true, Some(d)) => format!("{}   ⚠ needs Hessians (calib={d})", r.name),
+                (true, None) => format!("{}   ⚠ needs Hessians (CALIB)", r.name),
+                _ => r.name.clone(),
+            }
         }));
         json!({
             "visible": c.visible, "sources": c.sources, "recipes": names, "recipeLabels": labels, "src": c.src, "recipe": c.recipe,
@@ -231,12 +260,31 @@ impl App {
         self.conv.recipes.iter().find(|r| r.name == self.conv.recipe).is_some_and(|r| recipe_needs_calib(&r.text))
     }
 
-    /// The calibration folder rad-convert will read: Environment's CALIB=, else the field.
-    fn conv_calib_dir(&self) -> Option<PathBuf> {
+    /// The selected recipe's fixed `calib=` folder (e.g. `/calib`), if its rules name one.
+    fn conv_fixed_calib(&self) -> Option<String> {
+        self.conv.recipes.iter().find(|r| r.name == self.conv.recipe).and_then(|r| recipe_fixed_calib(&r.text))
+    }
+
+    /// The Calibration data the user gave: Environment's CALIB=, else the field.
+    fn conv_user_calib_dir(&self) -> Option<PathBuf> {
         let from_env = shlex_split(&self.conv.env).unwrap_or_default().into_iter().find_map(|p| p.strip_prefix("CALIB=").map(String::from));
         let d = from_env.unwrap_or_else(|| self.conv.calib.clone());
         let d = d.trim();
         if d.is_empty() { None } else { Some(expanduser(d)) }
+    }
+
+    /// The calibration folder that is checked: the user's Calibration data, else the recipe's own
+    /// fixed folder (what rad-convert reads when no copy is run).
+    fn conv_calib_dir(&self) -> Option<PathBuf> {
+        self.conv_user_calib_dir().or_else(|| self.conv_fixed_calib().map(|d| expanduser(&d)))
+    }
+
+    /// A fixed-folder recipe with usable Calibration data of the user's somewhere else: the
+    /// copy reading $CALIB can be offered. Returns (fixed folder, the user's folder).
+    fn conv_copy_offer(&self) -> Option<(String, PathBuf)> {
+        let fixed = self.conv_fixed_calib()?;
+        let user = self.conv_user_calib_dir()?;
+        (user != expanduser(&fixed) && super::calib::grams_in(&user).0 > 0).then_some((fixed, user))
     }
 
     /// (usable, what the calibration folder holds).
@@ -272,12 +320,19 @@ impl App {
         } else {
             format!("LLM Duo can't record them for this checkpoint: {why}.")
         };
+        let fixed = match self.conv_fixed_calib() {
+            Some(d) => format!(
+                "This recipe names a fixed folder, calib={d}, instead of $CALIB: as it stands rad-convert reads the Hessians from {d}, not from Calibration data. \
+                 When you start with Calibration data set, LLM Duo asks whether to run a copy of the recipe that reads that folder instead (the recipe file is not changed).\n\n"
+            ),
+            None => String::new(),
+        };
         self.msg(
             "warning",
             &format!(
                 "The recipe \"{}\" is fitted by GPTQ against calibration Hessians: the statistics of every layer's input over a text corpus (CALIB).\n\n\
                  Without them rad-convert quantises those weights uncalibrated, which gives a worse model than the recipe's published numbers.\n\n\
-                 If you already have them, set \"Calibration data\" to their folder.\n\n{how}\n\n\
+                 {fixed}If you already have them, set \"Calibration data\" to their folder.\n\n{how}\n\n\
                  Without calibration data, a round-to-nearest recipe (e.g. q38-27b-iq8r-rtn) needs none.",
                 self.conv.recipe
             ),
@@ -350,6 +405,7 @@ impl App {
         self.conv_auto_sets();
         self.conv_default_out();
         self.conv.calib_confirmed = false;
+        self.conv.calib_copy = None;
         self.conv_update_info();
         self.conv_calib_alert();
     }
@@ -428,7 +484,7 @@ impl App {
         if !self.conv.out.trim().is_empty() && self.conv.out != self.conv.out_auto {
             return; // the user named it
         }
-        let name = PathBuf::from(&self.conv.src).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = src_base_name(&PathBuf::from(&self.conv.src));
         let mut tag = String::new();
         if let Some(r) = self.conv.recipes.iter().find(|r| r.name == self.conv.recipe) {
             // the format the trunk ends up in, not the recipe's name (an "nvfp4" recipe writes MXFP4)
@@ -481,7 +537,9 @@ impl App {
             if src.is_dir() || src.is_file() {
                 let sz = if src.is_dir() { dir_size(&src) } else { std::fs::metadata(&src).map(|m| m.len() as f64).unwrap_or(0.0) };
                 parts.push(format!("source {:.1} GiB", sz / GIB));
-                if src.is_dir() && !src.join("config.json").is_file() && decision_kind(&src).is_none() {
+                // a diffusers pipeline keeps its configs in the component folders
+                let pipeline = src.join("model_index.json").is_file() || src.join("modular_model_index.json").is_file();
+                if src.is_dir() && !pipeline && !src.join("config.json").is_file() && decision_kind(&src).is_none() {
                     parts.push("⚠ no config.json in that folder".into());
                 }
             } else {
@@ -496,6 +554,19 @@ impl App {
                 parts.push("⚠ the output file exists - it will be replaced".into());
             }
             parts.push(format!("→ {}", t.display()));
+        }
+        if let Some(r) = self.conv.recipes.iter().find(|r| r.name == self.conv.recipe) {
+            // the recipe's own usage line says what it converts from
+            match (recipe_source(&r.text), src.is_file(), src.is_dir()) {
+                (Some(RecipeSource::Dir), true, _) => parts.push(format!(
+                    "⚠ {} converts a whole release folder (its usage line names a directory); a single file lacks the parts and configs it reads",
+                    r.name
+                )),
+                (Some(RecipeSource::File), _, true) => {
+                    parts.push(format!("⚠ {} converts one .safetensors / .gguf file (see its usage line); pick the file with File…", r.name))
+                }
+                _ => {}
+            }
         }
         if self.conv.recipe == NO_RECIPE {
             parts.push("no recipe: bf16 / f16 / block-fp8 weights are kept as they are".into());
@@ -539,7 +610,19 @@ impl App {
         let mut cmd = vec![tool.to_string_lossy().into_owned(), abs(expanduser(c.src.trim())), "-o".into(), abs(out)];
         if c.recipe != NO_RECIPE {
             let r = c.recipes.iter().find(|r| r.name == c.recipe).ok_or("That recipe is no longer in the recipes folder.")?;
-            cmd.extend(["--recipe".into(), r.path.to_string_lossy().into_owned()]);
+            let path = if c.calib_copy == Some(true) {
+                // the copy the user chose: the same rules, calib= pointing at $CALIB
+                let p = calib_copy_path(&r.name);
+                let text = format!("# copy of {} by LLM Duo: fixed calib= folders replaced by $CALIB\n{}", r.path.display(), recipe_calib_to_env(&r.text));
+                if let Some(d) = p.parent() {
+                    std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+                }
+                std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))?;
+                p
+            } else {
+                r.path.clone()
+            };
+            cmd.extend(["--recipe".into(), path.to_string_lossy().into_owned()]);
         }
         let home = gs(g, "radiance_home", "");
         if !home.trim().is_empty() {
@@ -642,9 +725,32 @@ impl App {
             }
             return;
         }
+        if self.conv.calib_copy.is_none() && !self.conv.plan_only {
+            if let Some((fixed, user)) = self.conv_copy_offer() {
+                let fixed_status = match super::calib::grams_in(&expanduser(&fixed)) {
+                    (g, _) if g > 0 => format!("{fixed} holds {g} Hessian files"),
+                    _ if expanduser(&fixed).is_dir() => format!("{fixed} holds no Hessian files: every GPTQ weight would be quantised UNCALIBRATED"),
+                    _ => format!("{fixed} does not exist: every GPTQ weight would be quantised UNCALIBRATED"),
+                };
+                let recipe = self.conv.recipe.clone();
+                self.ask(
+                    &format!(
+                        "The recipe \"{recipe}\" reads its Hessians from a fixed folder, calib={fixed}, not from Calibration data:\n{}\n\n\
+                         Yes: run a copy of the recipe that reads Calibration data instead (calib=$CALIB). The recipe file is not changed; the copy goes to\n{}\n\n\
+                         No: run the recipe as it is ({fixed_status}).",
+                        user.display(),
+                        calib_copy_path(&recipe).display()
+                    ),
+                    "yesnocancel",
+                    Pending::ConvCalibCopy(replace_ok),
+                );
+                return;
+            }
+        }
         let (cmd, env) = match self.conv_command() {
             Ok(x) => x,
             Err(e) => {
+                self.conv.calib_copy = None;
                 self.msg("info", &e);
                 return;
             }
@@ -670,6 +776,10 @@ impl App {
         if self.conv.plan_only && env.iter().any(|e| e.0 == "CALIB" && e.1 == ph) {
             self.conv_log("[LLM Duo] HESSIANS NEEDED: this recipe needs calibration Hessians and none are set. As you confirmed, this plan check runs with CALIB = an empty stand-in folder; a real convert needs the Hessians");
         }
+        if self.conv.calib_copy == Some(true) {
+            let p = calib_copy_path(&self.conv.recipe);
+            self.conv_log(&format!("[LLM Duo] as you chose: running a copy of the recipe that reads the Hessians from CALIB instead of its fixed calib= folder ({}); the recipe file is unchanged", p.display()));
+        }
         let cwd = self.conv_cwd();
         let cd = cwd.as_ref().map(|d| format!("cd {} && ", shlex_quote(&d.to_string_lossy()))).unwrap_or_default();
         self.conv_log(&format!("$ {cd}{calib}{hip}{}", shlex_join(&cmd)));
@@ -682,6 +792,7 @@ impl App {
             }
         }
         self.conv.calib_confirmed = false;
+        self.conv.calib_copy = None;
         self.conv.out_path = target;
         self.conv.t0 = Some(Instant::now());
         self.conv.status = if self.conv.plan_only { "Planning…".into() } else { "Converting…".into() };
@@ -693,6 +804,18 @@ impl App {
         }
         self.conv.lines.push_back(line.to_string());
         self.push_event(json!({"type": "log", "side": "convert", "text": line}));
+    }
+
+    /// Answered: run a fixed-folder recipe as a copy reading $CALIB (true) or as it is (false).
+    pub fn conv_start_calib_copy(&mut self, replace_ok: bool, copy: bool) {
+        self.conv.calib_copy = Some(copy);
+        self.conv_start(replace_ok);
+    }
+
+    /// A start that was not confirmed (e.g. "Replace it?" answered no) asks again next time.
+    pub fn conv_forget_answers(&mut self) {
+        self.conv.calib_copy = None;
+        self.conv.calib_confirmed = false;
     }
 
     /// Confirmed: start without calibration data.

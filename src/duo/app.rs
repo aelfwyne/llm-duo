@@ -42,7 +42,13 @@ pub enum Pending {
     ConvDeleteUnfinished(PathBuf),
     ConvCloseRunning,
     ConvNoCalib(bool),
+    /// yes: run a copy of a fixed-calib= recipe that reads $CALIB; no: the recipe as it is
+    ConvCalibCopy(bool),
     BenchCloseRunning,
+    /// a pin of that name exists: yes replace, no keep both
+    FleetPin { name: String, pin: Value },
+    FleetLoadAnyway,
+    FleetRestart,
 }
 
 pub struct App {
@@ -74,6 +80,7 @@ pub struct App {
     quant_busy: bool,
     pub conv: super::rad_convert::Conv,
     pub bench: super::bench::Bench,
+    pub fleet: super::fleet_app::FleetRun,
     pub started: bool,
     detecting: bool,
     /// dashboard: GPU sensor samples and limits per device id
@@ -121,6 +128,7 @@ impl App {
             quant_busy: false,
             conv: super::rad_convert::Conv::new(),
             bench: super::bench::Bench::new(),
+            fleet: super::fleet_app::FleetRun::new(),
             started: false,
             detecting: false,
             gpu_hist: HashMap::new(),
@@ -576,6 +584,7 @@ impl App {
         self.conv_poll();
         self.cal_poll();
         self.bench_poll();
+        self.fleet_poll();
         self.run_timers();
     }
 
@@ -592,7 +601,7 @@ impl App {
 
     // =============================================================== close ==
     fn request_close(&mut self) {
-        if self.panes.iter().any(|p| p.proc.is_some()) {
+        if self.panes.iter().any(|p| p.proc.is_some()) || self.fleet.proc.is_some() {
             self.ask("Stop running models and quit?", "yesno", Pending::QuitModels);
             return;
         }
@@ -625,6 +634,7 @@ impl App {
         }
         self.cal_stop();
         self.bench_stop();
+        self.fleet_stop(true);
         self.r_probe_kill_all();
         for p in 0..2 {
             if self.panes[p].proc.is_some() {
@@ -663,6 +673,8 @@ impl App {
             Pending::ConvReplace => {
                 if yes {
                     self.conv_start(true);
+                } else {
+                    self.conv_forget_answers();
                 }
             }
             Pending::ConvDeleteUnfinished(f) => {
@@ -675,6 +687,11 @@ impl App {
                     self.conv_start_uncalibrated(replace_ok);
                 }
             }
+            Pending::ConvCalibCopy(replace_ok) => match ans {
+                "yes" => self.conv_start_calib_copy(replace_ok, true),
+                "no" => self.conv_start_calib_copy(replace_ok, false),
+                _ => {}
+            },
             Pending::ConvCloseRunning => match ans {
                 "yes" => {
                     self.conv_stop();
@@ -702,6 +719,17 @@ impl App {
                 "no" => self.quant.visible = false,
                 _ => {}
             },
+            Pending::FleetPin { name, pin } => self.fleet_answer_pin(name, pin, ans),
+            Pending::FleetLoadAnyway => {
+                if yes {
+                    self.fleet_load(true);
+                }
+            }
+            Pending::FleetRestart => {
+                if yes {
+                    self.fleet_apply_restart();
+                }
+            }
             Pending::BenchCloseRunning => match ans {
                 "yes" => {
                     self.bench_stop();
@@ -870,6 +898,8 @@ impl App {
             "side": pane.side,
             "backend": pane.backend,
             "isVllm": pane.is_vllm(), "isKobold": pane.is_kobold(), "isLlama": pane.is_llama(), "isRad": pane.is_rad(),
+            // a Radiance generator ("image", "video", …): its plugin sizes the step itself
+            "radGen": pane.info_r().and_then(|i| i.gen).map(|g| g.what).unwrap_or(""),
             "probing": pane.r_probe.is_some(),
             "badge": pane.badge.0, "badgeColor": pane.badge.1,
             "gpuName": pane.gpu_name, "gpuStat": pane.gpu_stat, "gpuStat2": pane.gpu_stat2,
@@ -923,7 +953,10 @@ impl App {
                 "why": self.why.is_some(),
                 "alerts": self.alerts.len(),
                 "dualOn": self.dual_on(),
-                "dualEnabled": self.panes[0].proc.is_none(),
+                "dualEnabled": self.panes[0].proc.is_none() && !self.fleet.on,
+                "fleetOn": self.fleet.on,
+                "fleetEnabled": self.fleet.proc.is_none(),
+                "fleetVisible": self.fleet.on || self.panes.iter().any(|p| p.is_rad()),
                 "quantVisible": self.refresh_quant_btn_visible(),
                 "quantLabel": if self.quant_busy { "Quantize… (running)" } else { "Quantize…" },
                 "convVisible": self.conv.proc.is_some() || self.panes.iter().any(|p| p.is_rad()),
@@ -933,14 +966,18 @@ impl App {
             "quant": self.quant_ui(),
             "convert": self.conv_ui(),
             "bench": self.bench_ui(),
+            "fleet": self.fleet_ui(),
             "lists": {
                 "kvTypes": KV_TYPES, "fa": ["on", "auto", "off"], "kbuilds": KOBOLD_BUILDS,
                 "vKvTypes": VLLM_KV_TYPES, "vDtypes": VLLM_DTYPES, "vQuant": VLLM_ONLINE_QUANT_KEYS,
                 "vReasoning": VLLM_REASONING,
                 "rKv": super::radiance::RAD_KV_TYPES, "rSpec": super::radiance::RAD_SPEC,
                 "rDraftWindow": super::radiance::RAD_DRAFT_WINDOW, "rVision": super::radiance::RAD_VISION,
-                "rEmbed": super::radiance::RAD_EMBED, "rPlacement": super::radiance::RAD_PLACEMENT,
+                "rEmbed": super::radiance::RAD_EMBED, "rNgram": super::radiance::RAD_NGRAM, "rPlacement": super::radiance::RAD_PLACEMENT,
                 "rReasoning": super::radiance::RAD_REASONING, "rTpWire": super::radiance::RAD_TP_WIRE,
+                "rCvec": super::radiance::RAD_CVEC, "rStateDtype": super::radiance::RAD_STATE_DTYPE,
+                "rPrefetch": super::radiance::RAD_PREFETCH, "rAttnSplit": super::radiance::RAD_ATTN_SPLIT,
+                "rP2p": super::radiance::RAD_P2P,
             },
         })
     }
@@ -975,9 +1012,13 @@ impl App {
                 "saveLog" => self.save_log(p),
                 "showMetadata" => self.show_metadata(p),
                 "prefixCalc" => return self.prefix_calc(p),
+                "pinFleet" => self.fleet_pin_from_pane(p, None),
                 _ => {}
             }
             return Value::Null;
+        }
+        if target == "fleet" {
+            return self.fleet_call(action, arg);
         }
         if target == "dash" {
             return match action {

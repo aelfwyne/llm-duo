@@ -11,6 +11,7 @@ QQC2.Pane {
     property var pd: ({})          // this pane's part of Backend.uiJson
     property var help: ({})
     property var lists: ({})
+    property bool pinnable: false   // Radiance 2.0+: "Pin to fleet"
 
     padding: Kirigami.Units.largeSpacing
 
@@ -89,6 +90,29 @@ QQC2.Pane {
     readonly property bool wide: width >= Kirigami.Units.gridUnit * 34
     function st(k) { return pd.status ? (pd.status[k] || "—") : "—" }
     readonly property var vars: pd.vars || ({})
+
+    // Radiance's folded option sections: each option's unset value, so a folded header can say
+    // how many are set (an option hidden in a folded section still goes on the command line)
+    readonly property var radAdvanced: ({
+        r_cvec: "disabled", r_rope: "", r_state_dtype: "(default)", r_kv_resident: "0",
+        r_weight_prefetch: "on", r_prefill_interleave: "", r_prefix_ttl: "", r_disk_tier: false
+    })
+    readonly property var radSampling: ({
+        r_temp: "", r_top_k: "", r_top_p: "", r_min_p: "", r_typical_p: "", r_presence: "",
+        r_frequency: "", r_rep_pen: "", r_rep_last_n: "", r_dry_mult: "", r_dry_base: "",
+        r_dry_len: "", r_dry_last_n: "", r_xtc_prob: "", r_xtc_thresh: "", r_max_tokens: ""
+    })
+    function radSetCount(defs) {
+        let n = 0
+        for (const k in defs) {
+            const v = vars[k]
+            if (v === undefined || v === null) continue
+            if (typeof defs[k] === "boolean") { if (!!v !== defs[k]) n++; continue }
+            const t = String(v).trim()
+            if (t !== "" && t !== defs[k]) n++
+        }
+        return n
+    }
 
     QQC2.ScrollView {
         id: paneScroll
@@ -240,6 +264,20 @@ QQC2.Pane {
                         enabled: !pv.running
                         help: pv.h("r_tp_wire")
                     }
+                    OptLabel { visible: !!pd.isRad; text: "Attention split"; help: pv.h("r_tp_attn_split") }
+                    OptCombo {
+                        visible: !!pd.isRad
+                        pane: pv; key: "r_tp_attn_split"; values: pv.lists.rAttnSplit || []
+                        enabled: !pv.running
+                        help: pv.h("r_tp_attn_split")
+                    }
+                    OptLabel { visible: !!pd.isRad; text: "Peer access"; help: pv.h("r_p2p") }
+                    OptCombo {
+                        visible: !!pd.isRad
+                        pane: pv; key: "r_p2p"; values: pv.lists.rP2p || []
+                        enabled: !pv.running
+                        help: pv.h("r_p2p")
+                    }
                     OptLabel { visible: !pd.isRad; text: "Ratio"; help: pv.h(pd.isVllm ? "v_dual_ts" : "dual_ts") }
                     OptText {
                         visible: !pd.isRad
@@ -330,6 +368,14 @@ QQC2.Pane {
                 HelpTip { text: pv.h("bench"); shown: benchBtn.hovered }
             }
             Item { Layout.fillWidth: true }
+            QQC2.Button {
+                id: pinBtn
+                visible: !!pd.isRad && pv.pinnable
+                text: "Pin to fleet"
+                icon.name: "window-pin"
+                onClicked: pv.act("pinFleet")
+                HelpTip { text: pv.h("fleet_pin"); shown: pinBtn.hovered }
+            }
             QQC2.Button {
                 id: copyBtn
                 text: "Copy command"
@@ -662,10 +708,15 @@ QQC2.Pane {
     // ============================================================= Radiance
     Component {
         id: radOptions
-        GridLayout {
-            id: rg
+        ColumnLayout {
+            id: rcol
             // longer labels than llama.cpp's: four pairs a row only when there is room
             readonly property bool w8: pv.width >= Kirigami.Units.gridUnit * 46
+            spacing: Kirigami.Units.smallSpacing
+        GridLayout {
+            id: rg
+            Layout.fillWidth: true
+            readonly property bool w8: rcol.w8
             columns: w8 ? 8 : 4
             columnSpacing: Kirigami.Units.smallSpacing
             rowSpacing: Kirigami.Units.smallSpacing
@@ -704,6 +755,8 @@ QQC2.Pane {
             OptCombo { pane: pv; key: "r_vision"; values: pv.lists.rVision || []; help: pv.h("r_vision") }
             OptLabel { text: "Embedding"; help: pv.h("r_embed") }
             OptCombo { pane: pv; key: "r_embed"; values: pv.lists.rEmbed || []; help: pv.h("r_embed") }
+            OptLabel { text: "N-gram table"; help: pv.h("r_ngram_place") }
+            OptCombo { pane: pv; key: "r_ngram_place"; values: pv.lists.rNgram || []; help: pv.h("r_ngram_place") }
             OptLabel { text: "Placement"; help: pv.h("r_placement") }
             OptCombo { pane: pv; key: "r_placement"; values: pv.lists.rPlacement || []; help: pv.h("r_placement") }
             OptLabel { text: "Host pool"; help: pv.h("r_host_pool") }
@@ -713,6 +766,13 @@ QQC2.Pane {
             PrefixField { key: "r_prefix_mib"; help: pv.h("r_prefix_mib") }
             OptLabel { text: "Prefill span"; help: pv.h("r_prefill_span") }
             OptSpin { pane: pv; key: "r_prefill_span"; from: 1; to: 16; help: pv.h("r_prefill_span") }
+            OptLabel { text: "Prompt lookup"; help: pv.h("r_spec_ngram") }
+            OptSpin { pane: pv; key: "r_spec_ngram"; from: 0; to: 64; help: pv.h("r_spec_ngram") }
+
+            OptLabel { text: "N-gram min"; help: pv.h("r_ngram") }
+            OptSpin { pane: pv; key: "r_ngram_min"; from: 1; to: 15; help: pv.h("r_ngram") }
+            OptLabel { text: "N-gram max"; help: pv.h("r_ngram") }
+            OptSpin { pane: pv; key: "r_ngram_max"; from: 1; to: 15; help: pv.h("r_ngram") }
             OptLabel { text: "Reasoning"; help: pv.h("r_reasoning") }
             QQC2.ComboBox {
                 id: rReasonBox
@@ -739,17 +799,153 @@ QQC2.Pane {
                 HelpTip { text: pv.h("r_reasoning"); shown: rReasonBox.hovered && !rReasonBox.popup.visible }
             }
 
-            OptLabel { text: "Prompt lookup"; help: pv.h("r_spec_ngram") }
-            OptSpin { pane: pv; key: "r_spec_ngram"; from: 0; to: 64; help: pv.h("r_spec_ngram") }
-            OptLabel { text: "N-gram min"; help: pv.h("r_ngram") }
-            OptSpin { pane: pv; key: "r_ngram_min"; from: 1; to: 15; help: pv.h("r_ngram") }
-            OptLabel { text: "N-gram max"; help: pv.h("r_ngram") }
-            OptSpin { pane: pv; key: "r_ngram_max"; from: 1; to: 15; help: pv.h("r_ngram") }
-
             OptLabel { text: "Extra args"; help: pv.h("r_extra") }
             OptText {
                 pane: pv; key: "extra"; help: pv.h("r_extra")
                 Layout.columnSpan: rg.w8 ? 7 : 3; Layout.fillWidth: true
+            }
+        }
+            // generators only (image, video, audio, 3D): outside the grid, so its rows stay whole
+            OptCheck {
+                visible: !!pd.radGen
+                pane: pv; key: "r_gen_auto"
+                text: "Radiance sizes it: leave Batch tokens, Max seqs and Context to the " + (pd.radGen || "") + " model"
+                help: pv.h("r_gen_auto")
+            }
+
+            QQC2.ToolButton {
+                id: radAdvBtn
+                checkable: true
+                readonly property int nSet: pv.radSetCount(pv.radAdvanced)
+                text: (checked ? "▾ " : "▸ ") + "Advanced" + (nSet > 0 ? "  (" + nSet + " set)" : "")
+                HelpTip { text: pv.h("r_advanced"); shown: radAdvBtn.hovered }
+            }
+            GridLayout {
+                visible: radAdvBtn.checked
+                Layout.fillWidth: true
+                columns: rcol.w8 ? 8 : 4
+                columnSpacing: Kirigami.Units.smallSpacing
+                rowSpacing: Kirigami.Units.smallSpacing
+                OptLabel { text: "Control vector"; help: pv.h("r_cvec") }
+                OptCombo { pane: pv; key: "r_cvec"; values: pv.lists.rCvec || []; help: pv.h("r_cvec") }
+                OptLabel { text: "RoPE scaling"; help: pv.h("r_rope") }
+                OptText {
+                    pane: pv; key: "r_rope"; help: pv.h("r_rope"); placeholderText: "none"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "State cache"; help: pv.h("r_state_dtype") }
+                OptCombo { pane: pv; key: "r_state_dtype"; values: pv.lists.rStateDtype || []; help: pv.h("r_state_dtype") }
+                OptLabel { text: "KV resident"; help: pv.h("r_kv_resident") }
+                OptSpin { pane: pv; key: "r_kv_resident"; from: 0; to: 4194304; stepSize: 4096; help: pv.h("r_kv_resident") }
+                OptLabel { text: "Weight prefetch"; help: pv.h("r_weight_prefetch") }
+                OptCombo { pane: pv; key: "r_weight_prefetch"; values: pv.lists.rPrefetch || []; help: pv.h("r_weight_prefetch") }
+                OptLabel { text: "Prefill interleave"; help: pv.h("r_prefill_interleave") }
+                OptText {
+                    pane: pv; key: "r_prefill_interleave"; help: pv.h("r_prefill_interleave"); placeholderText: "auto:1"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Prefix cache TTL"; help: pv.h("r_prefix_ttl") }
+                OptText {
+                    pane: pv; key: "r_prefix_ttl"; help: pv.h("r_prefix_ttl"); placeholderText: "3600"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Weights disk tier"; help: pv.h("r_disk_tier") }
+                OptCheck { pane: pv; key: "r_disk_tier"; text: "read from the container"; help: pv.h("r_disk_tier") }
+            }
+
+            QQC2.ToolButton {
+                id: radSampBtn
+                checkable: true
+                readonly property int nSet: pv.radSetCount(pv.radSampling)
+                text: (checked ? "▾ " : "▸ ") + "Sampling defaults" + (nSet > 0 ? "  (" + nSet + " set)" : "")
+                HelpTip { text: pv.h("r_sampling"); shown: radSampBtn.hovered }
+            }
+            GridLayout {
+                visible: radSampBtn.checked
+                Layout.fillWidth: true
+                columns: rcol.w8 ? 8 : 4
+                columnSpacing: Kirigami.Units.smallSpacing
+                rowSpacing: Kirigami.Units.smallSpacing
+                OptLabel { text: "Temperature"; help: pv.h("r_temp") }
+                OptText {
+                    pane: pv; key: "r_temp"; help: pv.h("r_temp"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Top-k"; help: pv.h("r_top_k") }
+                OptText {
+                    pane: pv; key: "r_top_k"; help: pv.h("r_top_k"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Top-p"; help: pv.h("r_top_p") }
+                OptText {
+                    pane: pv; key: "r_top_p"; help: pv.h("r_top_p"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Min-p"; help: pv.h("r_min_p") }
+                OptText {
+                    pane: pv; key: "r_min_p"; help: pv.h("r_min_p"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Typical-p"; help: pv.h("r_typical_p") }
+                OptText {
+                    pane: pv; key: "r_typical_p"; help: pv.h("r_typical_p"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Presence penalty"; help: pv.h("r_presence") }
+                OptText {
+                    pane: pv; key: "r_presence"; help: pv.h("r_presence"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Frequency penalty"; help: pv.h("r_frequency") }
+                OptText {
+                    pane: pv; key: "r_frequency"; help: pv.h("r_frequency"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Repetition penalty"; help: pv.h("r_rep_pen") }
+                OptText {
+                    pane: pv; key: "r_rep_pen"; help: pv.h("r_rep_pen"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Penalty window"; help: pv.h("r_rep_last_n") }
+                OptText {
+                    pane: pv; key: "r_rep_last_n"; help: pv.h("r_rep_last_n"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "DRY multiplier"; help: pv.h("r_dry_mult") }
+                OptText {
+                    pane: pv; key: "r_dry_mult"; help: pv.h("r_dry_mult"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "DRY base"; help: pv.h("r_dry_base") }
+                OptText {
+                    pane: pv; key: "r_dry_base"; help: pv.h("r_dry_base"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "DRY allowed length"; help: pv.h("r_dry_len") }
+                OptText {
+                    pane: pv; key: "r_dry_len"; help: pv.h("r_dry_len"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "DRY window"; help: pv.h("r_dry_last_n") }
+                OptText {
+                    pane: pv; key: "r_dry_last_n"; help: pv.h("r_dry_last_n"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "XTC probability"; help: pv.h("r_xtc_prob") }
+                OptText {
+                    pane: pv; key: "r_xtc_prob"; help: pv.h("r_xtc_prob"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "XTC threshold"; help: pv.h("r_xtc_thresh") }
+                OptText {
+                    pane: pv; key: "r_xtc_thresh"; help: pv.h("r_xtc_thresh"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
+                OptLabel { text: "Default max tokens"; help: pv.h("r_max_tokens") }
+                OptText {
+                    pane: pv; key: "r_max_tokens"; help: pv.h("r_max_tokens"); placeholderText: "model's"
+                    Layout.fillWidth: true; Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+                }
             }
         }
     }

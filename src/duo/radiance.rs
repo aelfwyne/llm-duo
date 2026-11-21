@@ -21,7 +21,158 @@ pub const RAD_SPEC: [&str; 9] = ["auto", "0", "1", "2", "3", "4", "5", "6", "8"]
 pub const RAD_DRAFT_WINDOW: [&str; 2] = ["fixed", "adaptive"];
 pub const RAD_VISION: [&str; 3] = ["(default)", "vram", "ram"];
 pub const RAD_EMBED: [&str; 3] = ["(default)", "ram", "vram"];
+/// `--ngram-placement`: where an n-gram embedding table lives (Qwen3.8-Flash-Next: 47.7 GiB).
+pub const RAD_NGRAM: [&str; 4] = ["(default)", "vram", "ram", "disk"];
 pub const RAD_PLACEMENT: [&str; 4] = ["auto", "all_vram", "layer_offload", "expert_tiered"];
+/// `--control-vector`: disabled loads nothing; off / on load the vector found for the model and
+/// start requests without / with it (a request's `control_vector` field overrides).
+pub const RAD_CVEC: [&str; 3] = ["disabled", "off", "on"];
+/// `--state-cache-dtype`: the recurrent (delta-net) state cache; f16 is lossy, qwen35 plugins only.
+pub const RAD_STATE_DTYPE: [&str; 3] = ["(default)", "f32", "f16"];
+pub const RAD_PREFETCH: [&str; 2] = ["on", "off"];
+/// `--tp-attn-split`: how a prefill-sized step's attention splits over the ranks.
+pub const RAD_ATTN_SPLIT: [&str; 2] = ["heads", "rows"];
+/// `--p2p`: how the collectives reach the other cards.
+pub const RAD_P2P: [&str; 3] = ["auto", "on", "off"];
+
+/// How a free-text option's value is checked before Load (blank always means "not set").
+#[derive(Clone, Copy, Debug)]
+pub enum Check {
+    /// a number in [min, max] (`open_min`: above min), `int` a whole number, `auto` also takes "auto"
+    Num { min: f64, max: f64, open_min: bool, int: bool, auto: bool },
+    /// `none` or `yarn:FACTOR[:ORIG]`
+    Rope,
+    /// N in 0..=64, `auto` or `auto:SHARE` with 0 < SHARE <= 4
+    Interleave,
+}
+
+const fn num(min: f64, max: f64, open_min: bool, int: bool) -> Check {
+    Check::Num { min, max, open_min, int, auto: false }
+}
+
+/// A Radiance option typed as text: passed as `flag value` when not blank.
+pub struct RadTextOpt {
+    pub key: &'static str,
+    pub flag: &'static str,
+    pub label: &'static str,
+    pub check: Check,
+}
+
+const INF: f64 = f64::INFINITY;
+
+/// The free-text options: the Advanced ones, then the sampling defaults (radiance --help).
+pub const RAD_TEXT_OPTS: [RadTextOpt; 19] = [
+    RadTextOpt { key: "r_rope", flag: "--rope-scaling", label: "RoPE scaling", check: Check::Rope },
+    RadTextOpt { key: "r_prefill_interleave", flag: "--prefill-interleave", label: "Prefill interleave", check: Check::Interleave },
+    RadTextOpt { key: "r_prefix_ttl", flag: "--prefix-cache-ttl", label: "Prefix cache TTL", check: num(0.0, INF, false, true) },
+    RadTextOpt { key: "r_temp", flag: "--temp", label: "Temperature", check: num(0.0, INF, false, false) },
+    RadTextOpt { key: "r_top_k", flag: "--top-k", label: "Top-k", check: num(0.0, INF, false, true) },
+    RadTextOpt { key: "r_top_p", flag: "--top-p", label: "Top-p", check: num(0.0, 1.0, true, false) },
+    RadTextOpt { key: "r_min_p", flag: "--min-p", label: "Min-p", check: num(0.0, 1.0, false, false) },
+    RadTextOpt { key: "r_typical_p", flag: "--typical-p", label: "Typical-p", check: num(0.0, 1.0, true, false) },
+    RadTextOpt { key: "r_presence", flag: "--presence-penalty", label: "Presence penalty", check: num(-2.0, 2.0, false, false) },
+    RadTextOpt { key: "r_frequency", flag: "--frequency-penalty", label: "Frequency penalty", check: num(-2.0, 2.0, false, false) },
+    RadTextOpt { key: "r_rep_pen", flag: "--repetition-penalty", label: "Repetition penalty", check: num(0.0, INF, true, false) },
+    RadTextOpt { key: "r_rep_last_n", flag: "--repeat-last-n", label: "Penalty window", check: num(-1.0, INF, false, true) },
+    RadTextOpt { key: "r_dry_mult", flag: "--dry-multiplier", label: "DRY multiplier", check: num(0.0, INF, false, false) },
+    RadTextOpt { key: "r_dry_base", flag: "--dry-base", label: "DRY base", check: num(1.0, INF, false, false) },
+    RadTextOpt { key: "r_dry_len", flag: "--dry-allowed-length", label: "DRY allowed length", check: num(1.0, INF, false, true) },
+    RadTextOpt { key: "r_dry_last_n", flag: "--dry-penalty-last-n", label: "DRY window", check: num(-1.0, INF, false, true) },
+    RadTextOpt { key: "r_xtc_prob", flag: "--xtc-probability", label: "XTC probability", check: num(0.0, 1.0, false, false) },
+    RadTextOpt { key: "r_xtc_thresh", flag: "--xtc-threshold", label: "XTC threshold", check: num(0.0, 1.0, false, false) },
+    RadTextOpt {
+        key: "r_max_tokens",
+        flag: "--default-max-tokens",
+        label: "Default max tokens",
+        check: Check::Num { min: 1.0, max: INF, open_min: false, int: true, auto: true },
+    },
+];
+
+/// What is wrong with a free-text option's value, None when it is blank or valid.
+pub fn text_opt_problem(o: &RadTextOpt, v: &str) -> Option<String> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let bad = |why: &str| Some(format!("{} \"{v}\" {why}", o.label));
+    match o.check {
+        Check::Num { min, max, open_min, int, auto } => {
+            if auto && v == "auto" {
+                return None;
+            }
+            let n = if int { v.parse::<i64>().map(|n| n as f64).ok() } else { v.parse::<f64>().ok().filter(|f| f.is_finite()) };
+            let Some(n) = n else {
+                return bad(if int { "is not a whole number" } else { "is not a number" });
+            };
+            let low = if open_min { n <= min } else { n < min };
+            if low || n > max {
+                let lo = if open_min { format!("above {min}") } else { format!("at least {min}") };
+                return bad(&if max.is_finite() { format!("must be {lo} and at most {max}") } else { format!("must be {lo}") });
+            }
+            None
+        }
+        Check::Rope => match rope_spec(v) {
+            Ok(_) => None,
+            Err(e) => bad(&e),
+        },
+        Check::Interleave => {
+            if v == "auto" {
+                return None;
+            }
+            if let Some(sh) = v.strip_prefix("auto:") {
+                return match sh.parse::<f64>() {
+                    Ok(x) if x > 0.0 && x <= 4.0 => None,
+                    _ => bad("needs a share above 0 and at most 4 after auto:"),
+                };
+            }
+            match v.parse::<i64>() {
+                Ok(n) if (0..=64).contains(&n) => None,
+                _ => bad("must be 0 to 64, auto or auto:SHARE"),
+            }
+        }
+    }
+}
+
+/// `--rope-scaling`: Ok(None) for `none`, Ok(Some((factor, orig))) for `yarn:FACTOR[:ORIG]`.
+pub fn rope_spec(v: &str) -> Result<Option<(f64, Option<i64>)>, String> {
+    let v = v.trim();
+    if v.is_empty() || v == "none" {
+        return Ok(None);
+    }
+    let Some(rest) = v.strip_prefix("yarn:") else {
+        return Err("must be yarn:FACTOR[:ORIG] or none".into());
+    };
+    let mut it = rest.splitn(2, ':');
+    let f = it.next().unwrap_or("").parse::<f64>().ok().filter(|f| f.is_finite() && *f > 1.0);
+    let Some(f) = f else {
+        return Err("needs a FACTOR above 1 (yarn:2)".into());
+    };
+    match it.next() {
+        None => Ok(Some((f, None))),
+        Some(o) => match o.parse::<i64>() {
+            Ok(n) if n > 0 => Ok(Some((f, Some(n)))),
+            _ => Err("needs ORIG as a positive whole number (the trained length)".into()),
+        },
+    }
+}
+
+/// The history window's label for an option this module adds.
+pub fn rad_opt_label(k: &str) -> Option<&'static str> {
+    if let Some(o) = RAD_TEXT_OPTS.iter().find(|o| o.key == k) {
+        return Some(o.label);
+    }
+    Some(match k {
+        "r_cvec" => "Control vector",
+        "r_state_dtype" => "State cache",
+        "r_kv_resident" => "KV resident",
+        "r_weight_prefetch" => "Weight prefetch",
+        "r_disk_tier" => "Weights disk tier",
+        "r_tp_attn_split" => "Attention split",
+        "r_p2p" => "Peer access",
+        _ => return None,
+    })
+}
+
 pub const RAD_REASONING: [&str; 7] = ["(default)", "none", "minimal", "low", "medium", "high", "xhigh"];
 pub const RAD_TP_WIRE: [&str; 2] = ["exact", "wht6"];
 pub const RAD_STRATEGIES: [&str; 1] = ["Tensor parallel"];
@@ -86,6 +237,13 @@ pub fn config_path(tag: &str) -> PathBuf {
 /// args included) lands at the level it belongs to, and a flag the server would refuse is refused
 /// here with the server's message. Writes it to `path` and returns the YAML text.
 pub fn write_config(cmd: &[String], env: &[(String, String)], path: &Path) -> Result<String, String> {
+    let yaml = rad_yaml(cmd, env)?;
+    write_private(path, &yaml)?;
+    Ok(yaml)
+}
+
+/// The YAML `rad-yaml` prints for a 1.x-style flag line (`cmd[0]` the radiance binary).
+pub fn rad_yaml(cmd: &[String], env: &[(String, String)]) -> Result<String, String> {
     use std::process::{Command, Stdio};
     let bin = cmd.first().ok_or("empty command")?;
     let tool = tool_path(bin, "rad-yaml");
@@ -99,17 +257,18 @@ pub fn write_config(cmd: &[String], env: &[(String, String)], path: &Path) -> Re
     if !out.status.success() {
         return Err(if err.is_empty() { format!("rad-yaml failed ({})", out.status) } else { err });
     }
-    let yaml = String::from_utf8_lossy(&out.stdout).into_owned();
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Write a configuration readable by its owner only (an api-key given in Extra args lands in it).
+pub fn write_private(path: &Path, text: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    std::fs::write(path, &yaml).map_err(|e| format!("{}: {e}", path.display()))?;
-    {
-        // an api-key given in Extra args lands in the file
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(yaml)
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
 }
 
 /// The configuration as log lines, indented under the command, with any `api-key:` hidden.
@@ -260,6 +419,11 @@ pub struct RadInfo {
     pub n_layer: usize,
     pub vision: bool,
     pub draft: bool,
+    /// A generator (image, video, audio, 3D shape): its plugin sizes the step itself.
+    pub gen: Option<&'static GenStep>,
+    /// Bytes of the n-gram embedding table (`*ple_ngram*` weights), 0 where the model has none.
+    /// It is placed on its own (`--ngram-placement`), not with the other weights.
+    pub ngram_bytes: f64,
     /// A drafter Radiance 2.0 verifies as a tree (Gemma 4 with DFlash2, RadArchProbe::tree_pays).
     /// A tree's acceptance cannot move an i8 KV cache's rows, so with speculation on and
     /// `kv-cache-dtype: i8` the engine stops on the first request; LLM Duo serves it at bf16.
@@ -271,7 +435,39 @@ pub struct RadInfo {
     pub note: String,
 }
 
-fn dir_bytes(d: &Path) -> f64 {
+/// Whether the n-gram table sits on the cards: `vram` puts all of it on every card; Radiance's
+/// own choice (auto) takes vram only when it fits beside the other weights; ram and disk keep it off.
+/// `total` is the container, `head` the headroom, `card_min` the smallest card, in bytes.
+pub fn ngram_on_card(choice: &str, total: f64, table: f64, tp: f64, head: f64, card_min: f64) -> bool {
+    table > 0.0
+        && match choice {
+            "vram" => true,
+            "(default)" | "auto" => (total - table) / tp + table + head <= card_min,
+            _ => false,
+        }
+}
+
+/// The weights one card holds: the container less an off-card n-gram table (an on-card one is
+/// whole on every card) and less the host pool (`host_pool`: the model's total, shared by the
+/// ranks), split over `tp` cards.
+pub fn card_weight_bytes(total: f64, table: f64, table_on_card: bool, host_pool: f64, tp: f64) -> f64 {
+    let tp = tp.max(1.0);
+    let split = (total - table - host_pool).max(0.0) / tp;
+    split + if table_on_card { table } else { 0.0 }
+}
+
+/// The n-gram table's size from `rad-info --planes '*ngram*'` (one `offset bytes name` a line).
+pub fn ngram_plane_bytes(text: &str) -> f64 {
+    text.lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            let (_off, bytes, name) = (w.next()?.parse::<u64>().ok()?, w.next()?.parse::<u64>().ok()?, w.next()?);
+            name.contains("ngram").then_some(bytes as f64)
+        })
+        .sum()
+}
+
+pub fn dir_bytes(d: &Path) -> f64 {
     let mut t = 0.0;
     if let Ok(rd) = std::fs::read_dir(d) {
         for e in rd.filter_map(|e| e.ok()) {
@@ -340,8 +536,12 @@ impl RadInfo {
             Err(e) => r.note = format!("rad-info not available ({e}) - set the Radiance binary in Settings"),
         }
         if r.note.is_empty() {
-            if let Ok((_, text)) = run_capture(&[info.to_string_lossy().into_owned(), "--meta".into(), p], &env, Duration::from_secs(30)) {
+            let tool = info.to_string_lossy().into_owned();
+            if let Ok((_, text)) = run_capture(&[tool.clone(), "--meta".into(), p.clone()], &env, Duration::from_secs(30)) {
                 r.meta_text = text;
+            }
+            if let Ok((true, text)) = run_capture(&[tool, "--planes".into(), "*ngram*".into(), p], &env, Duration::from_secs(30)) {
+                r.ngram_bytes = ngram_plane_bytes(&text);
             }
         }
         r.parse();
@@ -424,6 +624,7 @@ impl RadInfo {
         let draft_arch = self.meta.iter().find(|m| m.0 == "draft.architectures").map(|m| m.1.clone()).unwrap_or_default();
         let block = meta("draft.block_size").or_else(|| meta("draft.dflash_config.block_size")).and_then(|b| b.parse::<i64>().ok()).unwrap_or(0);
         self.tree_drafter = self.arch.to_lowercase().starts_with("gemma4") && draft_arch.contains("DFlash2") && block > 1;
+        self.gen = gen_step(&self.arch);
         if !self.decision.is_empty() {
             self.kind = RadKind::Decision;
         } else if self.kind == RadKind::Generate {
@@ -463,7 +664,11 @@ impl RadInfo {
             parts.push("checkpoint folder".into());
         }
         match self.kind {
-            RadKind::Generate => {}
+            RadKind::Generate => {
+                if let Some(g) = self.gen {
+                    parts.push(format!("{} generator", g.what));
+                }
+            }
             RadKind::Embedding => parts.push("embedding model: /v1/embeddings".into()),
             RadKind::Rerank => parts.push("rerank model: /rerank, /v1/rerank".into()),
             RadKind::Decision if self.decision.is_empty() => parts.push("decision model: /v1/systemone".into()),
@@ -653,6 +858,27 @@ impl Budget {
     }
 }
 
+/// Radiance's warning that one full-length sequence's cache leaves the experts less VRAM than the
+/// host pool cannot hold (core/mem/vram_budget.cpp): (that cache, the experts' share, what they
+/// need on the card), in bytes. The planner then refuses the experts it pushes off ("DID NOT FIT").
+pub fn expert_shortfall(line: &str) -> Option<(f64, f64, f64)> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let re = R.get_or_init(|| {
+        Regex::new(
+            r"sequence's cache \(([\d.]+)\s*(B|KiB|MiB|GiB)\) leaves the experts ([\d.]+)\s*(B|KiB|MiB|GiB), short of the ([\d.]+)\s*(B|KiB|MiB|GiB)",
+        )
+        .unwrap()
+    });
+    let c = re.captures(line)?;
+    Some((bytes_of(&c[1], &c[2]), bytes_of(&c[3], &c[4]), bytes_of(&c[5], &c[6])))
+}
+
+/// A rank's "load: rank N, mover took …" line: placement passed for that card (it comes after the
+/// planner's verdict, before any weight is copied).
+pub fn is_rank_placed(line: &str) -> bool {
+    line.contains("load: rank ") && line.contains("mover took")
+}
+
 /// The client address of a "req refused from HOST:PORT -> 401 … api key" line.
 pub fn refused_401_from(line: &str) -> Option<String> {
     static R: OnceLock<Regex> = OnceLock::new();
@@ -694,6 +920,162 @@ pub fn parse_rad_metrics(text: &str) -> HashMap<String, f64> {
     out
 }
 
+// ------------------------------------------------------------- generators --
+/// Whether a generator's requests run guidance (two branches a step: the prompt and a negative one)
+/// at the plugin's default cfg.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Guidance {
+    Off,
+    On,
+    /// the default depends on the variant (a turbo / distilled one runs without)
+    ByVariant,
+}
+
+/// A generator plugin's step, from Radiance 2.1's `arch/<arch>/<arch>.cpp`. Radiance sizes
+/// `--max-num-batched-tokens` itself from the plugin (`RadArchProbe::gen_rows`) when it is not
+/// given; a step carries every branch's latent tokens and, in the joint-step layout, each branch's
+/// conditioning rows (`core/gen/driver.h`, `entry_rows`). A request whose step exceeds it is
+/// refused: "an image with its conditioning needs N rows a step and a step carries M".
+#[derive(Debug)]
+pub struct GenStep {
+    pub arch: &'static str,
+    /// "image", "video", "audio", "3D shape"
+    pub what: &'static str,
+    /// the plugin's `gen_rows`, what Radiance takes when Batch tokens is not given (0: computed
+    /// inside the plugin, not known here)
+    pub auto_rows: i64,
+    /// image models: pixels per latent token a side, the largest image's latent tokens, and the
+    /// conditioning rows a branch adds to a step (0: conditioned in a pass of its own)
+    pub latent_scale: i64,
+    pub max_tokens: i64,
+    pub cond_rows: i64,
+    /// rows each reference picture of an edit adds a branch (flux3)
+    pub ref_rows: i64,
+    pub guidance: Guidance,
+}
+
+const fn img(arch: &'static str, latent_scale: i64, max_tokens: i64, cond_rows: i64, ref_rows: i64, guidance: Guidance) -> GenStep {
+    GenStep {
+        arch,
+        what: "image",
+        auto_rows: 2 * (max_tokens + cond_rows + ref_rows),
+        latent_scale,
+        max_tokens,
+        cond_rows,
+        ref_rows,
+        guidance,
+    }
+}
+
+const fn other(arch: &'static str, what: &'static str, auto_rows: i64) -> GenStep {
+    GenStep { arch, what, auto_rows, latent_scale: 0, max_tokens: 0, cond_rows: 0, ref_rows: 0, guidance: Guidance::ByVariant }
+}
+
+pub const GEN_STEPS: [GenStep; 11] = [
+    // kMaxImageTokens 16384, kCondRows 512; cfg 0 for turbo, 4.5 otherwise
+    img("krea2", 16, 16384, 512, 0, Guidance::ByVariant),
+    // kMaxImageTokens 9216, kCondRows 512; cfg 4.0 (1.0 for variant 2)
+    img("anima", 16, 9216, 512, 0, Guidance::ByVariant),
+    // kMaxImageTokens 36864, kCondRows 77 x 8; cfg 6.0
+    img("sdxl", 8, 36864, 616, 0, Guidance::On),
+    // kMaxImageTokens 16800, joint grid: the conditioning has its own pass; cfg 1.0
+    img("qwenimage21", 16, 16800, 0, 0, Guidance::Off),
+    // kMaxImageTokens 16384, kMaxText 1040, a 1024 x 1024 reference 4569 rows; cfg 3.5 (1.0 flow map)
+    img("flux3", 16, 16384, 1040, 4569, Guidance::ByVariant),
+    other("ltx2", "video", 0),
+    other("minimaxh3", "video", 0),
+    other("hunyuan3d2", "3D shape", 0),
+    other("minimaxmusic3", "audio", 2048),
+    other("fishomni", "audio", 0),
+    other("breeze", "audio", 0),
+];
+
+pub fn gen_step(arch: &str) -> Option<&'static GenStep> {
+    GEN_STEPS.iter().find(|g| g.arch == arch)
+}
+
+impl GenStep {
+    pub fn is_image(&self) -> bool {
+        self.max_tokens > 0
+    }
+    /// Rows a step needs for the largest image with the longest prompt, one branch / two.
+    pub fn rows(&self, branches: i64) -> i64 {
+        branches * (self.max_tokens + self.cond_rows)
+    }
+    /// The largest square image (pixels a side, about: the size multiple rounds it down) whose
+    /// step fits `batched` rows with the longest prompt.
+    pub fn side_fitting(&self, batched: i64, branches: i64) -> i64 {
+        let t = (batched / branches.max(1) - self.cond_rows).clamp(0, self.max_tokens);
+        ((t as f64).sqrt().floor() as i64) * self.latent_scale
+    }
+    /// The largest image's side, if it were square.
+    pub fn max_side(&self) -> i64 {
+        ((self.max_tokens as f64).sqrt().floor() as i64) * self.latent_scale
+    }
+}
+
+/// What Batch tokens means for a generator: (red, text) when requests will be refused, None when
+/// it holds the largest request. `auto`: Batch tokens is left to Radiance.
+pub fn gen_batch_problem(g: &GenStep, batched: i64, auto: bool) -> Option<(bool, String)> {
+    if auto {
+        return None;
+    }
+    if !g.is_image() {
+        return Some((
+            false,
+            format!(
+                "a {} generator sizes its step itself{}; tick \"Radiance sizes it\" so Batch tokens, Max seqs and Context are left to it",
+                g.what,
+                if g.auto_rows > 0 { format!(" ({} rows)", fmt_thousands(g.auto_rows)) } else { String::new() }
+            ),
+        ));
+    }
+    let (one, two) = (g.rows(1), g.rows(2));
+    let side = g.max_side();
+    if batched < one {
+        let fit = g.side_fitting(batched, 1);
+        return Some((
+            true,
+            format!(
+                "Batch tokens {} is below the {} rows a step needs for the largest image (about {side}x{side}) with a full prompt: larger images and long prompts are refused when requested (about {fit}x{fit} fits). Set Batch tokens to {} ({} without guidance), or tick \"Radiance sizes it\"",
+                fmt_thousands(batched),
+                fmt_thousands(one),
+                fmt_thousands(two),
+                fmt_thousands(one)
+            ),
+        ));
+    }
+    if batched < two && g.guidance != Guidance::Off {
+        let fit = g.side_fitting(batched, 2);
+        return Some((
+            g.guidance == Guidance::On,
+            format!(
+                "with guidance (a negative prompt and cfg{}) a step carries both branches: the largest image then needs {} rows, and Batch tokens {} holds about {fit}x{fit}. Set {} or tick \"Radiance sizes it\" if you use guidance",
+                if g.guidance == Guidance::On { ", this model's default" } else { "; this model's turbo variants run without" },
+                fmt_thousands(two),
+                fmt_thousands(batched),
+                fmt_thousands(two)
+            ),
+        ));
+    }
+    None
+}
+
+/// A container's architecture from `rad-info` (its summary only), for checks that need no more.
+pub fn rad_arch(path: &Path) -> Option<String> {
+    if path.is_dir() {
+        return None;
+    }
+    let (bin, home) = tools();
+    let info = tool_path(&bin, "rad-info");
+    let mut env = vec![];
+    if !home.trim().is_empty() {
+        env.push(("RADIANCE_HOME".to_string(), expanduser(&home).to_string_lossy().into_owned()));
+    }
+    let (_, text) = run_capture(&[info.to_string_lossy().into_owned(), path.to_string_lossy().into_owned()], &env, Duration::from_secs(30)).ok()?;
+    text.lines().take(20).filter_map(kv_line).find(|(k, _)| k == "architecture").map(|(_, v)| v)
+}
+
 // ---------------------------------------------------------------- failure --
 pub fn rad_failure_hint(lines: &[String]) -> String {
     let text = lines.join("\n");
@@ -729,6 +1111,12 @@ pub fn rad_failure_hint(lines: &[String]) -> String {
     }
     if m(r"(?i)pool allocation refused|backing allocation of .* refused") {
         return "The card (or pinned host memory) refused an allocation - something else took memory after Radiance measured the card.\nStop the other process on that GPU (the other pane, a desktop app), or lower Host pool.".into();
+    }
+    if m(r"cannot be read with direct I/O[^\n]*n-gram table") {
+        return "N-gram table → disk reads the table with direct I/O, and the filesystem holding the container refuses it.\nMove the container to an ext4, XFS or btrfs drive, or set N-gram table to ram if RAM allows.".into();
+    }
+    if m(r"n-gram copy .*--ngram-placement ram") && m(r"the host pool is full") {
+        return "Radiance copied the n-gram table into pinned RAM, and the Host pool was left too little pinned memory for the experts that do not fit the cards.\nSet N-gram table to disk (read from the container; an NVMe keeps decoding fast), or lower Host pool if you want the table in RAM.".into();
     }
     if m(r"(?i)out of memory|would not back it") {
         return "Something else is holding VRAM on this card. Stop it (rocm-smi --showpids) and load again.".into();
@@ -924,9 +1312,83 @@ pub fn recipe_needs_repo_cwd(text: &str) -> bool {
     re.is_match(text)
 }
 
+/// What a recipe's usage line (`#   rad-convert <…> …` in its header) says to convert from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipeSource {
+    /// a folder: "<… pipeline directory>", "<… dir>"
+    Dir,
+    /// one weights file: "<checkpoint>.safetensors", "X-Q4_K_M.gguf"
+    File,
+}
+
+/// The source kind the recipe's own usage line names; None when it doesn't say
+/// (e.g. "<flint checkpoint>") or has no usage line.
+pub fn recipe_source(text: &str) -> Option<RecipeSource> {
+    let line = text.lines().take_while(|l| l.trim_start().starts_with('#') || l.trim().is_empty()).find_map(|l| {
+        let l = l.trim_start().trim_start_matches('#').trim_start();
+        l.strip_prefix("rad-convert ")
+    })?;
+    // the input is the first argument; a <placeholder> may hold spaces
+    let arg = if line.starts_with('<') {
+        let end = line.find('>')?;
+        let rest = &line[end + 1..];
+        format!("{}{}", &line[..=end], rest.split_whitespace().next().filter(|_| !rest.starts_with(' ')).unwrap_or(""))
+    } else {
+        line.split_whitespace().next()?.to_string()
+    };
+    let lc = arg.to_lowercase();
+    if lc.ends_with(".safetensors") || lc.ends_with(".gguf") {
+        Some(RecipeSource::File)
+    } else if lc.ends_with("directory>") || lc.ends_with(" dir>") || lc.ends_with("folder>") {
+        Some(RecipeSource::Dir)
+    } else {
+        None
+    }
+}
+
 /// A recipe rule reads `$CALIB` (GPTQ's calibration Hessians).
 pub fn recipe_needs_calib(text: &str) -> bool {
-    text.lines().any(|l| !l.trim_start().starts_with('#') && l.contains("$CALIB"))
+    recipe_calib_values(text).next().is_some()
+}
+
+/// The `calib=` values of a recipe's rules (comments skipped): `$CALIB`, or a fixed folder.
+fn recipe_calib_values(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .flat_map(|l| l.split_whitespace())
+        .filter_map(|w| w.strip_prefix("calib="))
+        .filter(|v| !v.is_empty())
+}
+
+/// The fixed folder a recipe's GPTQ rules read Hessians from (`calib=/calib`, as recipes taken
+/// from published containers have), instead of `$CALIB`. None when every rule uses a variable.
+pub fn recipe_fixed_calib(text: &str) -> Option<String> {
+    recipe_calib_values(text).find(|v| !v.starts_with('$')).map(String::from)
+}
+
+/// The recipe with every fixed `calib=` folder replaced by `$CALIB`, so it reads the folder
+/// given in CALIB (LLM Duo's Calibration data). Comments and everything else stay as they are.
+pub fn recipe_calib_to_env(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for l in text.split_inclusive('\n') {
+        if l.trim_start().starts_with('#') {
+            out.push_str(l);
+            continue;
+        }
+        let mut rest = l;
+        while let Some(i) = rest.find("calib=") {
+            let at_word = i == 0 || rest[..i].ends_with(char::is_whitespace);
+            out.push_str(&rest[..i + 6]);
+            rest = &rest[i + 6..];
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            if at_word && end > 0 && !rest.starts_with('$') {
+                out.push_str("$CALIB");
+                rest = &rest[end..];
+            }
+        }
+        out.push_str(rest);
+    }
+    out
 }
 
 /// The repository a recipes folder belongs to: `<repo>/data/recipes`, with the codebooks beside it.
@@ -983,6 +1445,8 @@ pub struct CkptKind {
     pub architectures: Vec<String>,
     /// Some(true): quantization_config present or quantised tensors; Some(false): bf16/f16/f32
     pub quantised: Option<bool>,
+    /// a mixture of experts by its config (Gemma 4 26B-A4B: enable_moe_block / num_experts)
+    pub moe: bool,
 }
 
 fn safetensors_dtypes(path: &Path) -> Vec<String> {
@@ -1021,6 +1485,9 @@ pub fn checkpoint_kind(dir: &Path) -> CkptKind {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
+    k.moe = [&cfg, &tc].iter().any(|c| {
+        c.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(false) || c.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) > 0
+    });
     if cfg.get("quantization_config").map(|v| !v.is_null()).unwrap_or(false)
         || tc.get("quantization_config").map(|v| !v.is_null()).unwrap_or(false)
     {
@@ -1054,7 +1521,8 @@ impl CkptKind {
         if mt.starts_with("qwen3_5") || mt.starts_with("qwen35") || ar.contains("qwen3_5") || ar.contains("qwen35") {
             if mt.contains("moe") || ar.contains("moe") { "qwen35moe" } else { "qwen35" }
         } else if mt.starts_with("gemma4") || ar.contains("gemma4") {
-            "gemma4"
+            // the 26B-A4B is served by arch/gemma4 and its recipe needs no --set keys
+            if self.moe { "gemma4moe" } else { "gemma4" }
         } else if mt.starts_with("gemma3") || ar.contains("gemma3") {
             "gemma3"
         } else if mt == "llama" {
@@ -1085,9 +1553,10 @@ pub fn known_sets(family: &str, rk: &RecipeKind) -> Option<(Vec<String>, String)
         "qwen35" | "qwen35moe" if rk.quantises_trunk() => {
             Some((fp8(), format!("select {}_fp8, which serves block-FP8, MXFP4 and int4 trunks", family)))
         }
-        "gemma4" if has("i4") || has("u4") => Some((
+        // dense only: int4 (w4a8, a4), int5 (w5) and int8 (i8g) trunks, as keptn's commands set it
+        "gemma4" if has("i4") || has("u4") || has("u5") || has("i8") => Some((
             vec!["quantization_config.quant_method=compressed-tensors".into()],
-            "select gemma4_bf16, the plugin that serves Gemma 4 31B at w4a8".into(),
+            "select gemma4_bf16, the plugin that serves Gemma 4's quantised dense trunks".into(),
         )),
         "llama" if has("fp8_e4m3") => None, // llama_dense_fp8 is chosen without keys
         _ => None,
@@ -1106,6 +1575,18 @@ pub fn opt_str(v: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recipe_sources() {
+        let h = |u: &str| format!("# x.recipe -- about\n#\n#   rad-convert {u}\n#       -o x.rad\n\nvae.* cast dtype=bf16\n");
+        assert_eq!(recipe_source(&h("<Krea-2-Raw or -Turbo pipeline directory> --recipe data/recipes/krea-2-bf16.recipe \\")), Some(RecipeSource::Dir));
+        assert_eq!(recipe_source(&h("<DeepSeek-V4.1-Flash-1017 dir> --add engram-tables.safetensors \\")), Some(RecipeSource::Dir));
+        assert_eq!(recipe_source(&h("<checkpoint>.safetensors --tokenizer <CLIP tokenizer.json> \\")), Some(RecipeSource::File));
+        assert_eq!(recipe_source(&h("<Anima>/split_files/diffusion_models/anima-aesthetic-v1.1.safetensors \\")), Some(RecipeSource::File));
+        assert_eq!(recipe_source(&h("Hy-Memory-30B-A3B-Q4_K_M.gguf \\")), Some(RecipeSource::File));
+        assert_eq!(recipe_source(&h("<flint checkpoint> --add data/flint-zero-bias.safetensors \\")), None);
+        assert_eq!(recipe_source("blk.*.attn_norm.weight cast dtype=f32\n"), None);
+    }
 
     #[test]
     fn tier_lines() {
@@ -1135,6 +1616,13 @@ mod tests {
         assert!(rre().serving.is_match("I serving on http://0.0.0.0:8080 (chat, completions)"));
         assert!(rre().serving.is_match("I model q38-27b serves  (/v1/completions; /v1/chat/completions with tools and reasoning)"));
         assert!(!rre().serving.is_match("I server: listening on http://127.0.0.1:8080 (16 threads, up to 64)"));
+        // Radiance 2.2, Gemma 4 26B-A4B w8a8 on one 32 GB card
+        let (kv, exp, need) = expert_shortfall("W one --max-model-len sequence's cache (5.35 GiB) leaves the experts 19.26 GiB, short of the 28.85 GiB the pinned host pool cannot hold: raise --host-pool-mib or lower --max-model-len").unwrap();
+        assert!((kv / GIB - 5.35).abs() < 1e-9 && (exp / GIB - 19.26).abs() < 1e-9 && (need / GIB - 28.85).abs() < 1e-9);
+        assert!(expert_shortfall("I kv: the pool backs 100% of the worst case").is_none());
+        assert!(is_rank_placed("I[1] load: rank 1, mover took 18.14 GiB, weights pool 173.75 KiB free of 18.14 GiB"));
+        assert!(is_rank_placed("I load: rank 0, mover took 23.89 GiB, weights pool 0 B free of 24.83 GiB"));
+        assert!(!is_rank_placed("I model Gemma-4: loading on card(s) 0"));
     }
 
     #[test]
@@ -1189,6 +1677,96 @@ mod tests {
         assert_eq!(r.n_ctx_train, 262144);
         assert_eq!(r.n_layer, 60);
         assert!(r.vision);
+    }
+
+    #[test]
+    fn text_opts() {
+        let o = |k: &str| RAD_TEXT_OPTS.iter().find(|o| o.key == k).unwrap();
+        assert!(text_opt_problem(o("r_temp"), "").is_none());
+        assert!(text_opt_problem(o("r_temp"), "0.7").is_none());
+        assert!(text_opt_problem(o("r_temp"), "-1").is_some());
+        assert!(text_opt_problem(o("r_temp"), "warm").is_some());
+        assert!(text_opt_problem(o("r_top_p"), "0").is_some(), "top_p is above 0");
+        assert!(text_opt_problem(o("r_top_p"), "1").is_none());
+        assert!(text_opt_problem(o("r_top_k"), "20.5").is_some());
+        assert!(text_opt_problem(o("r_presence"), "2.5").is_some());
+        assert!(text_opt_problem(o("r_rep_last_n"), "-1").is_none());
+        assert!(text_opt_problem(o("r_max_tokens"), "auto").is_none());
+        assert!(text_opt_problem(o("r_max_tokens"), "0").is_some());
+        assert!(text_opt_problem(o("r_prefill_interleave"), "auto:1").is_none());
+        assert!(text_opt_problem(o("r_prefill_interleave"), "auto:5").is_some());
+        assert!(text_opt_problem(o("r_prefill_interleave"), "65").is_some());
+        assert!(text_opt_problem(o("r_rope"), "yarn:2").is_none());
+        assert!(text_opt_problem(o("r_rope"), "yarn:1").is_some());
+        assert_eq!(rope_spec("yarn:2:131072"), Ok(Some((2.0, Some(131072)))));
+        assert_eq!(rope_spec("none"), Ok(None));
+        assert!(rope_spec("linear:2").is_err());
+        for o in RAD_TEXT_OPTS.iter() {
+            assert_eq!(rad_opt_label(o.key), Some(o.label));
+        }
+    }
+
+    #[test]
+    fn gen_steps() {
+        let k = gen_step("krea2").unwrap();
+        // what Radiance gives Batch tokens itself: 2 x (16384 + 512)
+        assert_eq!(k.auto_rows, 33792);
+        assert_eq!((k.rows(1), k.rows(2)), (16896, 33792));
+        assert_eq!(k.max_side(), 2048);
+        // the refused 2048 x 2048 request at 16384: red, and it names the numbers to set
+        let (red, t) = gen_batch_problem(k, 16384, false).unwrap();
+        assert!(red && t.contains("16,896") && t.contains("33,792"), "{t}");
+        // 17408 holds it without guidance; turbo runs without, so only a note
+        let (red, _) = gen_batch_problem(k, 17408, false).unwrap();
+        assert!(!red);
+        assert!(gen_batch_problem(k, 33792, false).is_none());
+        assert!(gen_batch_problem(k, 2048, true).is_none(), "Radiance sizes it");
+        assert_eq!(gen_step("qwenimage21").unwrap().rows(1), 16800);
+        assert!(gen_batch_problem(gen_step("qwenimage21").unwrap(), 16896, false).is_none(), "cfg 1.0: no guidance");
+        assert_eq!(gen_step("flux3").unwrap().auto_rows, 43986);
+        assert!(gen_batch_problem(gen_step("ltx2").unwrap(), 4096, false).is_some());
+        assert!(gen_step("qwen35").is_none());
+    }
+
+    #[test]
+    fn card_weights() {
+        const G: f64 = 1024.0 * 1024.0 * 1024.0;
+        // Flash-Next IQR-V4 at tp 2: 113.32 GiB, a 47.68 GiB n-gram table on disk, 24 GiB host pool
+        let (total, table) = (113.32 * G, 47.68 * G);
+        let card = 31.9 * G;
+        assert!(!ngram_on_card("disk", total, table, 2.0, 0.1 * G, card));
+        assert!(!ngram_on_card("(default)", total, table, 2.0, 0.1 * G, card), "auto cannot fit it on a card");
+        let w = card_weight_bytes(total, table, false, 24.0 * G, 2.0);
+        assert!((w / G - 20.82).abs() < 0.01, "{}", w / G);
+        // a plain model: everything split, nothing off the cards
+        assert_eq!(card_weight_bytes(30.0 * G, 0.0, false, 0.0, 2.0), 15.0 * G);
+        // vram: the whole table on every card
+        assert_eq!(card_weight_bytes(12.0 * G, 2.0 * G, true, 0.0, 2.0), 7.0 * G);
+    }
+
+    #[test]
+    fn ngram_table_size() {
+        // rad-info --planes '*ngram*' on qwen3.8-next-flash-iqr-v4.rad (the table and its scale)
+        let t = "75370496 51200245760 blk.1.ple_ngram.weight\n51275616256 2 blk.1.ple_ngram.weight\n";
+        assert_eq!(ngram_plane_bytes(t), 51200245762.0);
+        assert_eq!(ngram_plane_bytes(""), 0.0);
+        assert_eq!(ngram_plane_bytes("rad-info: no weight matches\n"), 0.0);
+    }
+
+    #[test]
+    fn hint_ngram() {
+        // from a Flash-Next load whose n-gram table went to RAM (auto) and starved the host pool
+        let pinned = vec![
+            "  n-gram copy              -     47.68 GiB   (--ngram-placement ram, pinned RAM the card reads, filled at load)".to_string(),
+            "    2935 x blk.*.ffn_gate_up_exps.*.weight (3.40 GiB): the host pool is full and no --weights-disk-tier was given".to_string(),
+            "E startup stopped: out of memory (the reason is said above the startup report)".to_string(),
+        ];
+        let h = rad_failure_hint(&pinned);
+        assert!(h.contains("N-gram table to disk"), "{h}");
+        // the same out of memory without the n-gram copy keeps the old hint
+        assert!(rad_failure_hint(&pinned[1..]).contains("holding VRAM"));
+        let dio = vec!["libavx: /mnt/x.rad cannot be read with direct I/O (Invalid argument); the n-gram table is read that way. A local filesystem".to_string()];
+        assert!(rad_failure_hint(&dio).contains("ext4, XFS or btrfs"));
     }
 
     #[test]
@@ -1362,6 +1940,22 @@ mod tests {
     }
 
     #[test]
+    fn calib_paths() {
+        let fixed = "output.weight rtn codes=i8 group=128\nblk.0.attn_qkv.weight gptq codes=u4 zero=u8 cd=0 calib=/calib\nblk.*.attn_o.weight rtn codes=u4\n";
+        assert!(recipe_needs_calib(fixed));
+        assert_eq!(recipe_fixed_calib(fixed).as_deref(), Some("/calib"));
+        let env = "# needs CALIB, e.g. calib=/somewhere\nblk.*.weight gptq codes=i4 calib=$CALIB\n";
+        assert!(recipe_needs_calib(env));
+        assert_eq!(recipe_fixed_calib(env), None);
+        assert!(!recipe_needs_calib("# gptq calib=/x\nblk.*.weight rtn codes=i8\n"));
+        assert!(!recipe_needs_calib("blk.*.weight rtn codes=i8 kld-calib-note=1\n"));
+        assert_eq!(
+            recipe_calib_to_env("# keep calib=/calib here\nblk.0.a.weight gptq calib=/calib cd=2\nblk.1.a.weight gptq cd=0 calib=/calib\nblk.2.a.weight gptq calib=$CALIB\nnocalib=/x\n"),
+            "# keep calib=/calib here\nblk.0.a.weight gptq calib=$CALIB cd=2\nblk.1.a.weight gptq cd=0 calib=$CALIB\nblk.2.a.weight gptq calib=$CALIB\nnocalib=/x\n"
+        );
+    }
+
+    #[test]
     fn kinds() {
         let r = "# PATTERN QUANTISER OPTIONS\nblk.*.ffn_*.weight  rtn codes=fp4_e2m1 group=32 scale=e8m0\noutput.weight rtn codes=fp8_e4m3 block=128x128\ndflash.*.weight cast dtype=bf16\n";
         let k = recipe_kind(r);
@@ -1377,6 +1971,15 @@ mod tests {
         assert_eq!(known_sets("gemma4", &g).unwrap().0, vec!["quantization_config.quant_method=compressed-tensors".to_string()]);
         assert_eq!(g.tag("gemma4-31b-dense-bf16-w4a8"), "w4a8");
         assert!(known_sets("", &g).is_none());
+        // keptn's w5 and i8g recipes need the same key; the 26B-A4B MoE (arch/gemma4) needs none
+        for codes in ["u5 zero=u8", "i8", "u4 zero=u8"] {
+            let r = recipe_kind(&format!("blk.*.attn_qkv.weight rtn codes={codes} group=128 scale=f16\n"));
+            assert!(known_sets("gemma4", &r).is_some(), "{codes}");
+            assert!(known_sets("gemma4moe", &r).is_none(), "{codes}");
+        }
+        let moe = CkptKind { model_type: "gemma4".into(), moe: true, ..Default::default() };
+        assert_eq!(moe.family(), "gemma4moe");
+        assert_eq!(CkptKind { model_type: "gemma4".into(), ..Default::default() }.family(), "gemma4");
         let ck = CkptKind { model_type: "qwen3_5".into(), ..Default::default() };
         assert_eq!(ck.family(), "qwen35");
         assert!(bf16_plugin_mismatch(&["E declare: weight 'blk.0.ffn_gate_up.weight' is declared bf16, and 'blk.0.ffn_gate_up.weight' holds codes as fp4_e2m1*e8m0[1x32]: only".to_string()]));

@@ -59,16 +59,40 @@ pub fn spawn(cmd: &[String], env: &[(String, String)], pty: bool, tx: Sender<Pro
     spawn_in(cmd, env, pty, None, tx)
 }
 
+/// `spawn` for a server (a pane's, Fit's plan check, the fleet): it must never outlive LLM Duo.
+/// Quitting stops it through the usual path; this covers every other way LLM Duo can end
+/// (the terminal it was started from closed, Ctrl+C, a kill, a crash): the kernel sends the
+/// server SIGTERM the moment LLM Duo's thread that started it ends. Servers are only started from
+/// the UI thread, which lives as long as the process.
+pub fn spawn_server(cmd: &[String], env: &[(String, String)], pty: bool, tx: Sender<ProcMsg>) -> std::io::Result<Proc> {
+    spawn_opts(cmd, env, pty, None, true, tx)
+}
+
 /// `spawn`, in the working directory `cwd` when one is given.
 pub fn spawn_in(cmd: &[String], env: &[(String, String)], pty: bool, cwd: Option<&Path>, tx: Sender<ProcMsg>) -> std::io::Result<Proc> {
+    spawn_opts(cmd, env, pty, cwd, false, tx)
+}
+
+fn spawn_opts(cmd: &[String], env: &[(String, String)], pty: bool, cwd: Option<&Path>, tied: bool, tx: Sender<ProcMsg>) -> std::io::Result<Proc> {
     let mut c = Command::new(&cmd[0]);
     c.args(&cmd[1..]).env_clear().envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     if let Some(d) = cwd {
         c.current_dir(d);
     }
+    let parent = unsafe { libc::getpid() };
     unsafe {
-        c.pre_exec(|| {
+        c.pre_exec(move || {
             libc::setsid();
+            if tied {
+                // SIGTERM, not SIGKILL: Radiance and the other servers release their cards on it
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // LLM Duo ended between the fork and the prctl: don't start at all
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::other("LLM Duo exited while starting the server"));
+                }
+            }
             Ok(())
         });
     }

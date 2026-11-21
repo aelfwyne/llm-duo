@@ -3,8 +3,9 @@
 //! quantisers read.
 //!
 //! The pipeline, run from the Convert window:
-//!   1. corpus   a JSONL file ({"prompt": …} or {"text": …} a line), or a folder of text files
-//!               made into one, documents cut to what the KV pool holds
+//!   1. corpus   a JSONL file ({"prompt": …} or {"text": …} a line, or chat rows {"messages": …}
+//!               rendered with the checkpoint's chat template), or a folder of text files, made
+//!               into one, documents cut to what the KV pool holds
 //!   2. record   `radiance --config` on the bf16 checkpoint with `calib-corpus` / `calib-dir`,
 //!               over every card chosen (tp), in layer slices when host RAM can't hold every
 //!               layer's Hessians at once (docs/TOOLS.md, "The calibration mode")
@@ -23,6 +24,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 
 use super::app::App;
+use super::chat_tmpl::ChatTemplate;
 use super::devices::Device;
 use super::proc::{self, Proc, ProcMsg};
 use super::radiance::{checkpoint_kind, uses_config};
@@ -124,7 +126,7 @@ pub fn unsupported(dir: &Path) -> Option<String> {
         "qwen35moe" => {
             return Some("a Qwen3.5/3.8 MoE records its experts' Hessians with Radiance's older tap at one card (docs/TOOLS.md, MOE-W4.md); LLM Duo only drives the dense models' calibration mode".into())
         }
-        "gemma4" => {
+        "gemma4" | "gemma4moe" => {
             return Some("Gemma 4 records its Hessians with arch/gemma4's own tap, fed by requests (docs/ARCHITECTURES.md, \"The 31B by GPTQ\"); LLM Duo only drives the dense Qwen3.5/3.8 calibration mode".into())
         }
         _ => {
@@ -309,12 +311,30 @@ pub fn grams_in(dir: &Path) -> (usize, usize) {
 }
 
 // --------------------------------------------------------------- corpus --
+/// What `build_corpus` made.
+#[derive(Debug, Default)]
+pub struct CorpusStats {
+    /// documents written (a long one counts once per piece)
+    pub docs: usize,
+    pub chars: usize,
+    /// chat rows rendered with the checkpoint's template, and the template's file
+    pub chats: usize,
+    pub template: String,
+    /// chat rows the template refused, and the first reason
+    pub skipped: usize,
+    pub first_skip: String,
+}
+
 /// A JSONL corpus (each line `{"prompt": …}`), made from `src`: a .jsonl file whose lines carry
-/// `prompt` or `text`, or a folder of .txt / .md / .jsonl files. Documents longer than
-/// `max_chars` are cut into pieces. Returns (documents, characters).
-pub fn build_corpus(src: &Path, dst: &Path, max_chars: usize) -> Result<(usize, usize), String> {
+/// `prompt` or `text`, or chat rows (`messages`, optional `tools` and `thinking`) rendered with
+/// `checkpoint`'s own chat template; or a folder of .txt / .md / .jsonl files. Documents longer
+/// than `max_chars` are cut into pieces. Chat rows the template refuses are skipped and counted,
+/// as transformers' render scripts do.
+pub fn build_corpus(src: &Path, dst: &Path, max_chars: usize, checkpoint: &Path) -> Result<CorpusStats, String> {
     let mut w = std::io::BufWriter::new(std::fs::File::create(dst).map_err(|e| format!("{}: {e}", dst.display()))?);
     let (mut docs, mut chars) = (0usize, 0usize);
+    let mut tmpl: Option<ChatTemplate> = None;
+    let (mut chats, mut skipped, mut first_skip) = (0usize, 0usize, String::new());
     let mut emit = |text: &str, w: &mut std::io::BufWriter<std::fs::File>| -> Result<(), String> {
         let text = text.trim();
         if text.is_empty() {
@@ -361,9 +381,29 @@ pub fn build_corpus(src: &Path, dst: &Path, max_chars: usize) -> Result<(usize, 
                 }
                 let v: Value = serde_json::from_str(&line).map_err(|e| format!("{} line {}: {e}", p.display(), n + 1))?;
                 let t = v.get("prompt").or_else(|| v.get("text")).and_then(|x| x.as_str());
-                match t {
-                    Some(t) => emit(t, &mut w)?,
-                    None => return Err(format!("{} line {}: no \"prompt\" or \"text\" string", p.display(), n + 1)),
+                if let Some(t) = t {
+                    emit(t, &mut w)?;
+                    continue;
+                }
+                if !v.get("messages").is_some_and(|m| m.is_array()) {
+                    return Err(format!("{} line {}: no \"prompt\" or \"text\" string, and no \"messages\" list", p.display(), n + 1));
+                }
+                if tmpl.is_none() {
+                    let t = ChatTemplate::load(checkpoint).map_err(|e| format!("{} has chat rows (\"messages\"), which are rendered with the checkpoint's chat template: {e}", p.display()))?;
+                    tmpl = Some(t);
+                }
+                let row: minijinja::Value = serde_json::from_str(&line).map_err(|e| format!("{} line {}: {e}", p.display(), n + 1))?;
+                match tmpl.as_ref().unwrap().render(&row) {
+                    Ok(text) => {
+                        emit(&text, &mut w)?;
+                        chats += 1;
+                    }
+                    Err(e) => {
+                        if skipped == 0 {
+                            first_skip = format!("{} line {}: {e}", p.display(), n + 1);
+                        }
+                        skipped += 1;
+                    }
                 }
             }
         } else {
@@ -373,9 +413,13 @@ pub fn build_corpus(src: &Path, dst: &Path, max_chars: usize) -> Result<(usize, 
     }
     w.flush().map_err(|e| e.to_string())?;
     if docs == 0 {
+        if skipped > 0 {
+            return Err(format!("the chat template refused all {skipped} chat rows; the first: {first_skip}"));
+        }
         return Err("the corpus has no documents".into());
     }
-    Ok((docs, chars))
+    let template = tmpl.map(|t| t.source).unwrap_or_default();
+    Ok(CorpusStats { docs, chars, chats, template, skipped, first_skip })
 }
 
 // ------------------------------------------------------------------ app --
@@ -492,7 +536,7 @@ impl App {
         if c.corpus.trim().is_empty() {
             self.msg(
                 "info",
-                "Pick a corpus: a .jsonl file ({\"prompt\": …} or {\"text\": …} a line) or a folder of .txt / .md files.\n\nUse text like what the model will do (chat, code, tool calls, your language). Radiance's own calibrations used 1-2.5 million tokens.",
+                "Pick a corpus: a .jsonl file ({\"prompt\": …} or {\"text\": …} a line, or chat rows {\"messages\": …}, rendered with the checkpoint's chat template) or a folder of .txt / .md files.\n\nUse text like what the model will do (chat, code, tool calls, your language). Radiance's own calibrations used 1-2.5 million tokens.",
             );
             return;
         }
@@ -547,17 +591,32 @@ impl App {
         // about 3.5 characters a token; leave room for the template
         let max_chars = (max_len as usize).saturating_mul(3);
         std::thread::spawn(move || {
-            let r = build_corpus(&corpus_src, &corpus_file, max_chars);
+            let r = build_corpus(&corpus_src, &corpus_file, max_chars, &src);
             let _ = tx.send(Box::new(move |app: &mut App| app.cal_corpus_done(r)));
         });
     }
 
-    fn cal_corpus_done(&mut self, r: Result<(usize, usize), String>) {
+    fn cal_corpus_done(&mut self, r: Result<CorpusStats, String>) {
         if self.conv.cal.stage != Stage::Corpus {
             return;
         }
         match r {
-            Ok((docs, chars)) => {
+            Ok(st) => {
+                let (docs, chars) = (st.docs, st.chars);
+                if st.chats > 0 || st.skipped > 0 {
+                    self.cal_log(&format!(
+                        "[LLM Duo] corpus: {} chat rows rendered with {}",
+                        fmt_thousands(st.chats as i64),
+                        st.template
+                    ));
+                }
+                if st.skipped > 0 {
+                    self.cal_log(&format!(
+                        "[LLM Duo] note: the chat template refused {} chat rows, which are left out; the first: {}",
+                        fmt_thousands(st.skipped as i64),
+                        st.first_skip
+                    ));
+                }
                 self.cal_log(&format!(
                     "[LLM Duo] corpus: {} documents, ≈ {} tokens → {}",
                     fmt_thousands(docs as i64),
@@ -836,11 +895,25 @@ mod tests {
         std::fs::create_dir_all(dir.join("in")).unwrap();
         std::fs::write(dir.join("in/a.txt"), "x".repeat(700)).unwrap();
         std::fs::write(dir.join("in/b.jsonl"), "{\"text\": \"hello there, a document of some length\"}\n\n{\"prompt\": \"another document, long enough\"}\n").unwrap();
-        let (docs, _) = build_corpus(&dir.join("in"), &dir.join("c.jsonl"), 300).unwrap();
-        assert_eq!(docs, 3 + 2); // 700 chars in pieces of 300: 300, 300, 100
+        let st = build_corpus(&dir.join("in"), &dir.join("c.jsonl"), 300, &dir).unwrap();
+        assert_eq!(st.docs, 3 + 2); // 700 chars in pieces of 300: 300, 300, 100
         let bad = dir.join("bad.jsonl");
         std::fs::write(&bad, "{\"x\": 1}\n").unwrap();
-        assert!(build_corpus(&bad, &dir.join("c2.jsonl"), 300).is_err());
+        assert!(build_corpus(&bad, &dir.join("c2.jsonl"), 300, &dir).is_err());
+        // chat rows: rendered with the checkpoint's template; one the template refuses is skipped
+        let chat = dir.join("chat.jsonl");
+        std::fs::write(&chat, "{\"messages\": [{\"role\": \"user\", \"content\": \"a question long enough\"}]}\n{\"messages\": [{\"role\": \"bad\", \"content\": \"x\"}]}\n").unwrap();
+        assert!(build_corpus(&chat, &dir.join("c3.jsonl"), 300, &dir).unwrap_err().contains("chat template"));
+        std::fs::write(
+            dir.join("chat_template.jinja"),
+            "{% for m in messages %}{% if m.role not in ('user', 'assistant') %}{{ raise_exception('bad role') }}{% endif %}<|{{ m.role }}|>{{ m.content }}{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}",
+        )
+        .unwrap();
+        let st = build_corpus(&chat, &dir.join("c3.jsonl"), 300, &dir).unwrap();
+        assert_eq!((st.docs, st.chats, st.skipped), (1, 1, 1));
+        assert!(st.first_skip.ends_with("line 2: bad role"));
+        let out = std::fs::read_to_string(dir.join("c3.jsonl")).unwrap();
+        assert_eq!(out.trim(), r#"{"prompt":"<|user|>a question long enough<|assistant|>"}"#);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

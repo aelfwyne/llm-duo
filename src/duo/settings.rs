@@ -1,4 +1,5 @@
-//! Persistent settings: global options, per-(GPU, model) options, calibration and stats.
+//! Persistent settings: global options, per-(GPU, model) options, calibration, stats and the
+//! Fleet mode pins.
 //! File format is identical to the Python app's `llm_duo_settings.json`.
 
 use serde_json::{Map, Value};
@@ -25,7 +26,7 @@ impl Settings {
         let path = Self::settings_file();
         let mut s = Settings { data: Map::new(), path: path.clone() };
         s.data.insert("global".into(), Value::Object(default_global()));
-        for k in ["models", "calib", "stats"] {
+        for k in ["models", "calib", "stats", "fleet"] {
             s.data.insert(k.into(), Value::Object(Map::new()));
         }
         if let Some(dir) = path.parent() {
@@ -38,7 +39,7 @@ impl Settings {
         if path.exists() {
             match std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
                 Some(Value::Object(loaded)) => {
-                    for k in ["global", "models", "calib", "stats"] {
+                    for k in ["global", "models", "calib", "stats", "fleet"] {
                         let src = obj(loaded.get(k));
                         let dst = s.data.get_mut(k).unwrap().as_object_mut().unwrap();
                         for (kk, vv) in src {
@@ -135,6 +136,13 @@ impl Settings {
     pub fn set_calib(&mut self, dev: &str, rel: &str, v: Opts) {
         self.sect_mut("calib").insert(Self::model_key(dev, rel), Value::Object(v));
         self.save();
+    }
+    /// Fleet mode: `pins`, `server` and `groups` (see fleet.rs).
+    pub fn fleet(&self) -> &Opts {
+        self.sect("fleet")
+    }
+    pub fn fleet_mut(&mut self) -> &mut Opts {
+        self.sect_mut("fleet")
     }
     pub fn raw_section(&self, name: &str) -> Opts {
         self.sect(name).clone()

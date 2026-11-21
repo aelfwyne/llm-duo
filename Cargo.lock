@@ -338,13 +338,15 @@ dependencies = [
 
 [[package]]
 name = "llm-duo"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "cxx",
  "cxx-qt",
  "cxx-qt-build",
  "cxx-qt-lib",
  "libc",
+ "minijinja",
+ "minijinja-contrib",
  "regex",
  "serde_json",
 ]
@@ -354,6 +356,25 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "minijinja"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "509eeb2603a84eccabb4d75f6ec8ba23b46bbf441aaeb863d6b83a5887fd51e4"
+dependencies = [
+ "indexmap",
+ "serde",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64b62a39daf92d02b89f7888ab57f08d15d22dab862e5c95353253f91e9344f0"
+dependencies = [
+ "minijinja",
+]
 
 [[package]]
 name = "proc-macro2"

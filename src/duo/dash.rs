@@ -96,10 +96,10 @@ fn insight(id: &str, scope: &str, level: &str, title: &str, text: String) -> Val
 }
 
 /// Display order of load options in the history window (keys not listed come last, sorted).
-const OPT_ORDER: [&str; 50] = [
+const OPT_ORDER: [&str; 51] = [
     "ctx", "ngl", "n_cpu_moe", "fa", "kv", "kv_dtype", "r_kv", "dtype", "quant", "gpu_util", "parallel", "batch", "ubatch",
     "max_batched", "r_batched", "threads", "cpu_offload", "mtp", "mtp_n", "r_spec", "r_draft_window", "r_spec_ngram",
-    "r_ngram_min", "r_ngram_max", "r_headroom", "r_vision", "r_embed", "r_placement", "r_host_pool", "r_prefix_mib",
+    "r_ngram_min", "r_ngram_max", "r_headroom", "r_vision", "r_embed", "r_ngram_place", "r_placement", "r_host_pool", "r_prefix_mib",
     "cache_ram", "kv_offload", "r_prefill_span", "mmproj", "reasoning", "r_reasoning", "jinja", "relax_tpl", "eager", "text_only", "dual_strategy",
     "dual_mode", "dual_ts", "dual_first", "dual_moe_spread", "mtp_dev", "r_tp_wire", "extra", "kbuild", "kquiet",
 ];
@@ -136,6 +136,7 @@ fn opt_label(k: &str, backend: &str) -> String {
         "r_headroom" => "Headroom",
         "r_vision" => "Vision tower",
         "r_embed" => "Embedding",
+        "r_ngram_place" => "N-gram table",
         "r_placement" => "Placement",
         "r_host_pool" => "Host pool",
         "r_prefix_mib" | "cache_ram" | "kv_offload" => "Prefix cache",
@@ -156,7 +157,7 @@ fn opt_label(k: &str, backend: &str) -> String {
         "extra" => "Extra args",
         "kbuild" => "Build",
         "kquiet" => "Quiet log",
-        _ => return k.to_string(),
+        _ => return super::radiance::rad_opt_label(k).map(String::from).unwrap_or_else(|| k.to_string()),
     }
     .to_string()
 }
@@ -205,7 +206,7 @@ fn stats_row(key: &str, rel: &str, st: &Opts, status: &str) -> Value {
     let mut setup = Map::new();
     for k in ["ctx", "kv", "kv_dtype", "ngl", "n_cpu_moe", "batch", "ubatch", "parallel", "threads", "fa", "mtp", "mtp_n",
               "dual_strategy", "dual_mode", "extra", "gpu_util", "dtype", "max_batched", "cpu_offload",
-              "r_kv", "r_batched", "r_spec", "r_spec_ngram", "r_draft_window", "r_vision", "r_placement", "r_host_pool", "r_tp_wire"] {
+              "r_kv", "r_batched", "r_spec", "r_spec_ngram", "r_draft_window", "r_vision", "r_ngram_place", "r_placement", "r_host_pool", "r_tp_wire"] {
         if (k.starts_with("dual_") || k == "r_tp_wire") && !dual {
             continue; // stored for every setup, only meaningful in Dual GPU mode
         }

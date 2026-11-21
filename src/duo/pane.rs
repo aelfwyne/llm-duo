@@ -149,15 +149,19 @@ pub struct Mon {
     pub gtt_noted: f64,
 }
 
-pub const BOOL_VARS: [&str; 6] = ["jinja", "relax_tpl", "dual_moe_spread", "eager", "text_only", "kquiet"];
-pub const ALL_VARS: [&str; 50] = [
+pub const BOOL_VARS: [&str; 8] = ["jinja", "relax_tpl", "dual_moe_spread", "eager", "text_only", "kquiet", "r_disk_tier", "r_gen_auto"];
+pub const ALL_VARS: [&str; 78] = [
     "ctx", "ngl", "fa", "kv", "n_cpu_moe", "parallel", "threads", "batch", "ubatch", "port", "jinja", "relax_tpl",
     "dual_strategy", "dual_mode", "dual_ts", "dual_first", "dual_moe_spread", "mmproj", "mtp", "mtp_n", "extra",
     "cache_ram", "kv_offload",
     "gpu_util", "kv_dtype", "dtype", "max_batched", "cpu_offload", "eager", "text_only", "reasoning", "quant", "kbuild",
     // Radiance
-    "r_kv", "r_batched", "r_headroom", "r_spec", "r_spec_ngram", "r_ngram_min", "r_ngram_max", "r_draft_window", "r_vision", "r_embed", "r_placement", "r_host_pool",
+    "r_kv", "r_batched", "r_headroom", "r_spec", "r_spec_ngram", "r_ngram_min", "r_ngram_max", "r_draft_window", "r_vision", "r_embed", "r_ngram_place", "r_placement", "r_host_pool",
     "r_prefix_mib", "r_prefill_span", "r_reasoning", "r_tp_wire",
+    // Radiance: Advanced, Dual GPU and sampling defaults (radiance::RAD_TEXT_OPTS for the text ones)
+    "r_cvec", "r_state_dtype", "r_kv_resident", "r_weight_prefetch", "r_disk_tier", "r_tp_attn_split", "r_p2p", "r_gen_auto",
+    "r_rope", "r_prefill_interleave", "r_prefix_ttl", "r_temp", "r_top_k", "r_top_p", "r_min_p", "r_typical_p", "r_presence", "r_frequency",
+    "r_rep_pen", "r_rep_last_n", "r_dry_mult", "r_dry_base", "r_dry_len", "r_dry_last_n", "r_xtc_prob", "r_xtc_thresh", "r_max_tokens",
     // llama.cpp Dual GPU: the card the MTP drafter runs on ("(auto)" or a device id)
     "mtp_dev",
 ];
@@ -231,8 +235,13 @@ pub struct Pane {
     pub r_budget: super::radiance::Budget,
     pub r_arena: Option<f64>,
     pub r_settled: Vec<(i64, f64)>,
-    /// Fit's plan check: a short radiance run that is stopped once it states its KV pool
+    /// Fit's plan check: a short radiance run that is stopped once it states its KV pool and
+    /// its weights are placed
     pub r_probe: Option<super::pane_r::Probe>,
+    /// a stopped plan check still exiting: its VRAM is not free until it has
+    pub r_probe_dying: Option<Arc<std::sync::Mutex<std::process::Child>>>,
+    /// the next plan check (ctx, lo, hi, tries), started once the last one has exited
+    pub r_probe_next: Option<(i64, Option<i64>, Option<i64>, u32)>,
     /// devices of the running load (for HIP_VISIBLE_DEVICES / monitors)
     pub r_devs: Vec<Device>,
     pub r_stats: Option<Value>,
@@ -386,6 +395,8 @@ impl Pane {
             r_arena: None,
             r_settled: vec![],
             r_probe: None,
+            r_probe_dying: None,
+            r_probe_next: None,
             r_devs: vec![],
             r_stats: None,
             r_stats_t: None,
@@ -717,7 +728,15 @@ impl App {
             return st.get_model(&self.dev_key(p), rel, Some(&default_vllm_model()));
         }
         if pane.is_rad() {
-            return st.get_model(&self.dev_key(p), rel, Some(&default_rad_model()));
+            let mut s = st.get_model(&self.dev_key(p), rel, Some(&default_rad_model()));
+            // a generator seen for the first time: let Radiance size its step (Batch tokens, Max
+            // seqs, Context); saved settings are kept as they are
+            if !st.has_model(&self.dev_key(p), rel)
+                && super::radiance::rad_arch(&self.models_root(p).join(rel)).and_then(|a| super::radiance::gen_step(&a)).is_some()
+            {
+                s.insert("r_gen_auto".into(), Value::Bool(true));
+            }
+            return s;
         }
         let mut s;
         if pane.is_kobold() && !st.has_model(&self.dev_key(p), rel) {

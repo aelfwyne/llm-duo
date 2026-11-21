@@ -43,6 +43,11 @@ QQC2.ApplicationWindow {
         id: srcDialog
         onAccepted: win.call("setSrc", win.toPath(selectedFolder))
     }
+    FileDialog {
+        id: srcFileDialog
+        nameFilters: ["Weights (*.safetensors *.gguf *.index.json)", "All files (*)"]
+        onAccepted: win.call("setSrc", win.toPath(selectedFile))
+    }
     FolderDialog {
         id: draftDialog
         onAccepted: { draftField.text = win.toPath(selectedFolder); win.call("setDraft", draftField.text) }
@@ -89,7 +94,7 @@ QQC2.ApplicationWindow {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
             color: Kirigami.Theme.disabledTextColor
-            text: "Writes a Radiance .rad container from a Hugging Face checkpoint folder (safetensors + config.json). "
+            text: "Writes a Radiance .rad container from a Hugging Face checkpoint folder (safetensors + config.json), or a single .safetensors or .gguf file. "
                 + "A recipe decides each weight's quantisation; recipes are read from " + (win.c.recipesDir || "the recipes folder")
                 + ". A finetune uses its base model's recipe. Runs in the background - you can keep using LLM Duo or close this window."
         }
@@ -127,10 +132,20 @@ QQC2.ApplicationWindow {
                     HelpTip { text: win.h("c_source"); shown: srcBox.hovered && !srcBox.popup.visible }
                 }
                 QQC2.Button {
-                    text: "Browse…"
+                    id: srcFolderBtn
+                    text: "Folder…"
                     icon.name: "document-open-folder"
                     enabled: !win.c.running
                     onClicked: srcDialog.open()
+                    HelpTip { text: "Pick a checkpoint folder (config.json + *.safetensors)"; shown: srcFolderBtn.hovered }
+                }
+                QQC2.Button {
+                    id: srcFileBtn
+                    text: "File…"
+                    icon.name: "document-open"
+                    enabled: !win.c.running
+                    onClicked: srcFileDialog.open()
+                    HelpTip { text: "Pick a single .safetensors or .gguf file, or a *.safetensors.index.json"; shown: srcFileBtn.hovered }
                 }
             }
             OptLabel { text: "Recipe"; help: win.h("c_recipe") }
@@ -320,7 +335,7 @@ QQC2.ApplicationWindow {
                     OptLabel { text: "Corpus"; help: win.h("c_calcorpus") }
                     RowLayout {
                         Layout.fillWidth: true
-                        BoundField { action: "calSetCorpus"; value: calPanel.k.corpus || ""; help: win.h("c_calcorpus"); placeholderText: ".jsonl file, or a folder of .txt / .md / .jsonl files" }
+                        BoundField { action: "calSetCorpus"; value: calPanel.k.corpus || ""; help: win.h("c_calcorpus"); placeholderText: ".jsonl file (prompt, text or chat messages), or a folder of .txt / .md / .jsonl files" }
                         QQC2.Button { text: "File…"; icon.name: "document-open"; onClicked: calCorpusFile.open() }
                         QQC2.Button { text: "Folder…"; icon.name: "document-open-folder"; onClicked: calCorpusDir.open() }
                     }

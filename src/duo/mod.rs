@@ -4,10 +4,13 @@
 pub mod app;
 pub mod bench;
 pub mod calib;
+pub mod chat_tmpl;
 pub mod consts;
 pub mod dash;
 pub mod devices;
 pub mod estimate;
+pub mod fleet;
+pub mod fleet_app;
 pub mod gguf;
 pub mod http;
 pub mod kobold;

@@ -61,12 +61,14 @@ Kirigami.ApplicationWindow {
             if (e.side === "quant") quantWindow.appendLog(e.text)
             else if (e.side === "convert") convertWindow.appendLog(e.text)
             else if (e.side === "bench") benchWindow.appendLog(e.text)
+            else if (e.side === "fleet") fleetView.appendLog(e.text)
             else (e.side === "left" ? leftPane : rightPane).appendLog(e.text)
             break
         case "logClear":
             if (e.side === "quant") quantWindow.clearLog()
             else if (e.side === "convert") convertWindow.clearLog()
             else if (e.side === "bench") benchWindow.clearLog()
+            else if (e.side === "fleet") fleetView.clearLog()
             else (e.side === "left" ? leftPane : rightPane).clearLog()
             break
         case "msg":
@@ -287,6 +289,18 @@ Kirigami.ApplicationWindow {
                     }
                     HelpTip { text: root.help["dual_toggle"] || ""; shown: dualBox.hovered }
                 }
+                QQC2.CheckBox {
+                    id: fleetBox
+                    text: "Fleet mode"
+                    visible: !!root.app.fleetVisible
+                    checked: !!root.app.fleetOn
+                    enabled: root.app.fleetEnabled !== false
+                    onToggled: {
+                        Backend.call("fleet", "setMode", JSON.stringify({ on: checked }))
+                        fleetBox.checked = Qt.binding(function () { return !!root.app.fleetOn })
+                    }
+                    HelpTip { text: root.help["fleet_mode"] || ""; shown: fleetBox.hovered }
+                }
                 QQC2.Label {
                     Layout.fillWidth: true
                     Layout.leftMargin: Kirigami.Units.largeSpacing
@@ -309,14 +323,24 @@ Kirigami.ApplicationWindow {
             }
         }
 
+        FleetView {
+            id: fleetView
+            anchors.fill: parent
+            visible: !!root.app.fleetOn
+            fd: root.ui.fleet || ({})
+            help: root.help
+        }
+
         QQC2.SplitView {
             anchors.fill: parent
             orientation: Qt.Horizontal
+            visible: !root.app.fleetOn
 
             PaneView {
                 id: leftPane
                 side: "left"
                 pd: root.panes[0] || ({})
+                pinnable: !!(root.ui.fleet || {}).pinnable
                 help: root.help
                 lists: root.ui.lists || ({})
                 QQC2.SplitView.fillWidth: true
@@ -325,6 +349,7 @@ Kirigami.ApplicationWindow {
             PaneView {
                 id: rightPane
                 side: "right"
+                pinnable: !!(root.ui.fleet || {}).pinnable
                 // Dual GPU mode: the right pane collapses; the left pane shows both cards' monitors
                 visible: !root.app.dualOn
                 pd: root.panes[1] || ({})

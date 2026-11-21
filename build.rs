@@ -6,6 +6,7 @@ fn main() {
     CxxQtBuilder::new_qml_module(QmlModule::new("io.github.llmduo").qml_files([
         "qml/Main.qml",
         "qml/PaneView.qml",
+        "qml/FleetView.qml",
         "qml/SettingsWindow.qml",
         "qml/QuantizeWindow.qml",
         "qml/BenchWindow.qml",

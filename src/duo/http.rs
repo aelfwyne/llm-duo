@@ -1,4 +1,5 @@
-//! Minimal HTTP/1.1 GET for polling the local servers (/health, /metrics, /api/extra/perf).
+//! Minimal HTTP/1.1 GET / POST for polling and steering the local servers (/health, /metrics,
+//! /api/extra/perf, Radiance's /admin routes).
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -15,6 +16,15 @@ pub fn get(host: &str, port: i64, path: &str, timeout: Duration) -> Result<Resp,
 
 /// GET with `Authorization: Bearer <token>` when the server was started with an API key / password.
 pub fn get_auth(host: &str, port: i64, path: &str, timeout: Duration, token: Option<&str>) -> Result<Resp, String> {
+    request("GET", host, port, path, timeout, token)
+}
+
+/// POST with an empty body (Radiance's /admin actions take none).
+pub fn post_auth(host: &str, port: i64, path: &str, timeout: Duration, token: Option<&str>) -> Result<Resp, String> {
+    request("POST", host, port, path, timeout, token)
+}
+
+fn request(method: &str, host: &str, port: i64, path: &str, timeout: Duration, token: Option<&str>) -> Result<Resp, String> {
     let addr = (host, port as u16)
         .to_socket_addrs()
         .map_err(|e| e.to_string())?
@@ -25,7 +35,8 @@ pub fn get_auth(host: &str, port: i64, path: &str, timeout: Duration, token: Opt
     s.set_write_timeout(Some(timeout)).ok();
     let hosthdr = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
     let auth = token.filter(|t| !t.is_empty()).map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {hosthdr}\r\nUser-Agent: llm-duo\r\nAccept: */*\r\n{auth}Connection: close\r\n\r\n");
+    let body = if method == "POST" { "Content-Length: 0\r\n" } else { "" };
+    let req = format!("{method} {path} HTTP/1.1\r\nHost: {hosthdr}\r\nUser-Agent: llm-duo\r\nAccept: */*\r\n{auth}{body}Connection: close\r\n\r\n");
     s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     let start = std::time::Instant::now();

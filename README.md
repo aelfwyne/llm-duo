@@ -202,8 +202,9 @@ finishes.
 in the Recipe list. Picking one pops up a warning, a banner holds the *Calibration data* folder
 (`gram.r*.bin` files) with a live check, and Start asks before converting without them.
 *Create Hessians…* records them for dense Qwen3.5 / Qwen3.8: it serves the bf16 checkpoint with
-Radiance 2.0's calibration mode over a corpus (a `.jsonl` file or a folder of text files), in
-layer slices when host RAM is short, converts the recordings into the files rad-convert reads, and
+Radiance 2.0's calibration mode over a corpus (a `.jsonl` file of `prompt` / `text` rows or chat
+rows with `messages`, which are rendered with the checkpoint's own chat template, or a folder of
+text files), in layer slices when host RAM is short, converts the recordings into the files rad-convert reads, and
 sets Calibration data. The bf16 weights must fit the chosen cards (Qwen3.8-27B needs two 32 GB
 cards); Gemma 4 records its Hessians another way and isn't supported.
 
@@ -216,6 +217,38 @@ are listed too. Naming `--arch` in Extra args turns the clef additions off.
 
 The log parsing is written from Radiance's documentation, not a live log. If a status line stays
 empty or Fit says it couldn't read the pool, send the startup log and the parser can be adjusted.
+
+### Fleet mode (several models, one process)
+
+Radiance 2.0 serves any number of models from one process (`docs/MULTIMODEL.md` in the Radiance checkout): a request picks its
+model by its `model` field, and Radiance loads, parks (to host RAM) and unloads models as requests
+arrive. A parked model comes back in a few seconds instead of a cold load.
+
+1. Set a model up on a Radiance pane as usual (Fit, KV cache, prefix cache, speculative decoding,
+   Extra args) and press **Pin to fleet**. The pin is a copy of those settings. On a single pane it
+   becomes `tp: 1`, and Radiance picks the card when it loads. In Dual GPU mode it becomes `tp: 2`
+   and takes both cards whenever it is loaded. No setting puts a model on one particular card.
+2. Tick **Fleet mode** in the toolbar, with both panes stopped: the fleet uses both cards
+   (`cards: all`). Each pin has the fleet's per-model keys: aliases (`default` takes requests that
+   name no model), priority, keep in VRAM (`pin`), idle TTL, park to RAM / restore, and KV / expert
+   flex limits. Below them are the fleet settings (port, host memory, disk tier, load timeout,
+   warm-up) and `together` / `exclusive` groups. Warm-up is off by default: Radiance's warm-up
+   loads models nobody asked for, an idle TTL never parks a model that hasn't served a request,
+   and a model needing room may evict one you are using instead.
+3. **Check** builds the file and runs `radiance --config FILE --check`, which only parses and
+   validates and does not check that the models fit. **Load** starts the fleet. The table shows
+   each model's state from `/admin/fleet`, with Load / Park / Unload / Keep buttons.
+4. Edits while it runs light up **Apply**, which sends `POST /admin/reload`: changed models reload
+   and the others keep serving. A change to the port, host memory or disk tier needs a restart,
+   and Apply asks before restarting.
+
+Each pin's flags go through `rad-yaml`, so Radiance's own parser builds the model entry.
+Process-wide settings found in a pane's Extra args (`server.log`, …) are listed when you pin and
+are left out. The file is `~/.local/share/llm-duo/radiance/fleet.yaml`, and the API key reaches it
+through `RADIANCE_API_KEY` only. A model's claim in a fleet is its weights plus one full-length
+context of KV, so the Context you Fit on a pane is what it asks for. When you pin, the claim is
+estimated from the pane's last load of that model. A context Fit tightly while the model ran
+alone may need a little trimming beside other models.
 
 ## Troubleshooting
 
@@ -237,6 +270,83 @@ cargo test     # needs the Qt dev packages too, since the crate links Qt
 ```
 
 ## Changelog
+
+### 1.1.2
+
+Added:
+
+- **Fleet mode** (Radiance 2.0+): pin a Radiance pane's configuration with *Pin to fleet*, then
+  serve every pin from one radiance process on both cards (multi-model serving, hot swapping by
+  the request's `model` field). It edits the fleet keys per model (aliases, priority, pin, ttl,
+  park, flex) and the fleet's port, host memory, disk tier, load timeout, warm-up and groups. It
+  checks with `radiance --check`, shows each model's state from `/admin/fleet` with Load / Park /
+  Unload / Keep, and applies edits by hot reload (`/admin/reload`). Radiance's warm-up is off
+  unless you turn it on, so only models that requests name take up a card.
+- *Create Hessians…* reads chat rows (`{"messages": […], "tools": …, "thinking": …}`, the format
+  of quant-calibration datasets) and renders them with the checkpoint's own chat template, the way
+  transformers' `apply_chat_template` does, so such a corpus no longer needs rendering in Python
+  first. Rows the template refuses are left out and counted in the log.
+- **N-gram table** option on the Radiance pane (`--ngram-placement`: vram, ram or disk) for
+  models with an n-gram embedding table (Qwen3.8-Flash-Next's is 47.7 GiB). The estimate shows
+  the table's size and where it goes, leaves it out of the card's weights when it is in RAM or on
+  disk, and warns before Load when Radiance's own choice could pin it in RAM beside a Host pool,
+  when ram needs more memory than is free, or when vram cannot hold it.
+- Radiance pane: an **Advanced** section (control vector, RoPE scaling / YaRN, state cache f16, KV
+  resident, weight prefetch, prefill interleave, prefix cache TTL, weights disk tier) and a
+  **Sampling defaults** section (temperature, top-k/p, min-p, typical-p, the presence, frequency
+  and repetition penalties, DRY, XTC, default max tokens), both folded, with a header that counts
+  the options set. Dual GPU gains *Attention split* and *Peer access*. Each has a tooltip on what
+  it does and which models take it. Before Load the estimate flags in red what Radiance would refuse
+  at startup: a control vector on a model other than Flash-Next, an f16 state cache outside the qwen35
+  plugins, the row attention split outside GLM-5.3, and sampling values out of range. With RoPE
+  scaling set, a Context past the trained length is measured against what YaRN reaches.
+- Recipes whose GPTQ rules name a fixed Hessians folder (`calib=/calib`, as the recipes taken from
+  keptn's Gemma 4 31B containers do) are marked "⚠ needs Hessians (calib=/calib)" and explained
+  when picked. With Calibration data set, Start asks whether to run a copy of the recipe that reads
+  it as `$CALIB` (the recipe file is not changed) or the recipe as it is.
+- `hf-model-finder.html` finds Radiance containers: add `radiance` or `rad` to the query (or pick
+  *radiance (.rad)* under Format) to list only repos that ship a `.rad` file, filter by container
+  quant (`w4a8`, `i8g`, `iq4r`, …) and by drafter (MTP, DFlash, DFlash2, DSpark), and copy a
+  resumable curl command for each `.rad` file.
+
+Fixed:
+
+- Radiance **Fit** reported a full-context fit for a model larger than the card (Gemma 4
+  26B-A4B w8a8, 35 GiB, on one 32 GB card). Radiance states the KV pool before it places the
+  weights, and the plan check stopped right there, so it never saw the `DID NOT FIT` that follows.
+  It now waits until every card has passed placement. When Radiance warns that the experts do not
+  fit beside one full-length sequence, Fit tries the context that frees enough for them, or, when
+  none does, says so with the Host pool that would make room (or Dual GPU mode). Plans recorded
+  the old way are no longer used; press Fit again.
+- After Fit, Load could say the settings don't fit: the plan check was still exiting and holding
+  its VRAM (≈ 18 GiB a card), which the estimate read as "already in use". Load, the estimate and
+  Fit's next try now wait until the stopped plan check has exited.
+- Image generators: LLM Duo always passed Batch tokens, which overrides the step size Radiance
+  takes from the model's plugin, so the largest images were refused at request time ("an image
+  with its conditioning needs 16525 rows a step and a step carries 16384"). LLM Duo now knows each
+  generator plugin's step (krea2, anima, sdxl, qwen-image 2.1 and flux3 exactly; video, audio and
+  3D generators by name). The estimate says before Load what the largest image needs (twice with
+  guidance) and what fits, the Fleet's checks name a pin that would refuse its largest image, and
+  *Radiance sizes it* (generators only) leaves Batch tokens, Max seqs and Context to Radiance;
+  a generator picked for the first time starts with it ticked, and saved settings are kept.
+- A fleet pin's estimated claim counted the whole container as weights on the cards, so a model
+  that keeps experts in the host pool or its n-gram table on disk (Qwen3.8-Flash-Next at tp 2:
+  ≈ 59 GiB a card) was reported as larger than a card and "may never load", though it loads. The
+  claim now leaves out the host pool and an n-gram table kept off the cards. Re-pin to update it.
+- A Radiance load that stopped with "out of memory" because the n-gram table was pinned in RAM and
+  left the Host pool full now says so and suggests N-gram table → disk. It used to say something
+  else was holding VRAM. A container on a filesystem without direct I/O (the disk tier needs it)
+  gets its own hint.
+- Servers (panes, Fit's plan check, the fleet) stop when LLM Duo ends in any way, not only when
+  its window is closed: closing the terminal it was started from, Ctrl+C, a kill or a crash used
+  to leave them running, holding the cards.
+- *Pin to fleet* on a pane whose model is already pinned under another name (a pin renamed, say
+  `Nemotron-Embed`) asks "This model is already pinned as Nemotron-Embed. Replace that pin?". It
+  used to look only for a pin with the file's own name, find none, and add a second pin, so the
+  new settings went to a copy that requests for the renamed pin never reached.
+- The `--set quantization_config.quant_method=compressed-tensors` key is filled in for dense
+  Gemma 4 int5 and int8 recipes too (keptn's `w5` and `i8g`), not only int4. Gemma 4 26B-A4B is
+  told apart as a mixture of experts and still gets none.
 
 ### 1.1.1
 

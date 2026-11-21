@@ -2,7 +2,8 @@
 //!
 //! Radiance sizes memory itself (see radiance.rs), so the "estimate" here is what the engine
 //! reported for the same memory settings - from a real load or from Fit's plan check, a short
-//! start of the server that is stopped as soon as the startup log states the KV pool.
+//! start of the server that is stopped once the startup log states the KV pool and every card
+//! has passed weight placement.
 
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -38,6 +39,11 @@ pub struct Probe {
     pub hi: Option<i64>,
     pub tries: u32,
     pub budget: Budget,
+    /// cards in the run, and how many have passed placement ("load: rank N, mover took")
+    pub ranks: usize,
+    pub placed: usize,
+    /// Radiance's warning that the experts do not fit beside one full-length sequence
+    pub short: Option<(f64, f64, f64)>,
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -77,12 +83,24 @@ impl App {
         o.insert("r_draft_window".into(), list_or(v.var_s("r_draft_window"), &RAD_DRAFT_WINDOW, "fixed").into());
         o.insert("r_vision".into(), list_or(v.var_s("r_vision"), &RAD_VISION, "(default)").into());
         o.insert("r_embed".into(), list_or(v.var_s("r_embed"), &RAD_EMBED, "(default)").into());
+        o.insert("r_ngram_place".into(), list_or(v.var_s("r_ngram_place"), &RAD_NGRAM, "(default)").into());
         o.insert("r_placement".into(), list_or(v.var_s("r_placement"), &RAD_PLACEMENT, "auto").into());
         o.insert("r_host_pool".into(), v.int("r_host_pool", 0).max(0).into());
         o.insert("r_prefix_mib".into(), v.int("r_prefix_mib", 0).max(0).into());
         o.insert("r_prefill_span".into(), v.int("r_prefill_span", 1).max(1).into());
         o.insert("r_reasoning".into(), Value::from(if reasoning.is_empty() { "(default)".to_string() } else { reasoning }));
         o.insert("r_tp_wire".into(), list_or(v.var_s("r_tp_wire"), &RAD_TP_WIRE, "exact").into());
+        o.insert("r_cvec".into(), list_or(v.var_s("r_cvec"), &RAD_CVEC, "disabled").into());
+        o.insert("r_state_dtype".into(), list_or(v.var_s("r_state_dtype"), &RAD_STATE_DTYPE, "(default)").into());
+        o.insert("r_kv_resident".into(), v.int("r_kv_resident", 0).max(0).into());
+        o.insert("r_weight_prefetch".into(), list_or(v.var_s("r_weight_prefetch"), &RAD_PREFETCH, "on").into());
+        o.insert("r_disk_tier".into(), v.var_b("r_disk_tier").into());
+        o.insert("r_gen_auto".into(), v.var_b("r_gen_auto").into());
+        o.insert("r_tp_attn_split".into(), list_or(v.var_s("r_tp_attn_split"), &RAD_ATTN_SPLIT, "heads").into());
+        o.insert("r_p2p".into(), list_or(v.var_s("r_p2p"), &RAD_P2P, "auto").into());
+        for t in RAD_TEXT_OPTS.iter() {
+            o.insert(t.key.into(), Value::from(v.var_s(t.key).trim().to_string()));
+        }
         o.insert("dual_strategy".into(), RAD_STRATEGIES[0].into());
         o.insert("dual_mode".into(), "tensor".into());
         o.insert("port".into(), v.int("port", self.default_port(p)).into());
@@ -135,7 +153,27 @@ impl App {
     pub fn r_pool_fp(&self, p: usize, s: &Opts) -> String {
         let mut names: Vec<String> = self.r_devs(p).iter().map(|d| d.name.clone()).collect();
         names.sort();
-        let vals: Vec<String> = RAD_POOL_KEYS.iter().map(|k| opt_str(s.get(*k))).collect();
+        let mut vals: Vec<String> = RAD_POOL_KEYS.iter().map(|k| opt_str(s.get(*k))).collect();
+        // the n-gram table's tier moves VRAM too; appended only when set, so plans recorded
+        // before the option existed (all at the default) still match
+        let ng = gs(s, "r_ngram_place", "(default)");
+        if ng != "(default)" {
+            vals.push(format!("ngram={ng}"));
+        }
+        // the same for the Advanced options that move memory
+        let st = gs(s, "r_state_dtype", "(default)");
+        if st != "(default)" {
+            vals.push(format!("state={st}"));
+        }
+        if gi(s, "r_kv_resident", 0) > 0 {
+            vals.push(format!("kvres={}", gi(s, "r_kv_resident", 0)));
+        }
+        if gs(s, "r_tp_attn_split", "heads") == "rows" {
+            vals.push("attn=rows".into());
+        }
+        if gb(s, "r_disk_tier", false) {
+            vals.push("disktier".into());
+        }
         format!("{}|{}", names.join("+"), vals.join(","))
     }
 
@@ -144,7 +182,13 @@ impl App {
         let rel = &self.panes[p].model_var;
         let rec = self.settings.get_calib(&self.dev_key(p), rel)?;
         let fp = self.r_pool_fp(p, s);
-        rec.get("pools").and_then(|v| v.get(&fp)).and_then(|v| v.as_object()).cloned()
+        rec.get("pools")
+            .and_then(|v| v.get(&fp))
+            .and_then(|v| v.as_object())
+            // a plan check recorded before it waited for placement may hold a pool for weights
+            // that never fit (it stopped at the KV line)
+            .filter(|o| gs(o, "source", "") != "probe" || gb(o, "placed", false))
+            .cloned()
     }
 
     fn r_save_pool(&mut self, p: usize, rel: &str, fp: &str, data: Value) {
@@ -294,11 +338,21 @@ impl App {
         let mut yellow = false;
         let mut min_left = f64::INFINITY;
         let mut tight_total = f64::INFINITY;
+        let ngram = gs(&s, "r_ngram_place", "(default)");
+        let card_min = devs.iter().map(|d| Self::v_total(d)).fold(f64::INFINITY, f64::min);
+        let table = info.ngram_bytes;
+        // vram puts the whole table on every card; Radiance's own choice (auto) takes vram only
+        // when it fits beside the other weights
+        let table_on_card = ngram_on_card(&ngram, info.bytes, table, tp, head, card_min);
+        // the cards' total: the host pool stays in the pane's own `offload` handling below
+        let weights = card_weight_bytes(info.bytes, table, table_on_card, 0.0, tp) * tp;
         for d in &devs {
             let total = Self::v_total(d);
             tight_total = tight_total.min(total);
-            let free = if self.panes[p].proc.is_some() { total } else { self.v_free(p, d) };
-            let w = info.bytes / tp;
+            // a plan check (running, or stopped and still exiting) holds VRAM the load will have
+            let probing = self.panes[p].r_probe.is_some() || self.panes[p].r_probe_dying.is_some();
+            let free = if self.panes[p].proc.is_some() || probing { total } else { self.v_free(p, d) };
+            let w = weights / tp;
             let left = free - head - w;
             min_left = min_left.min(left);
             let mut l = format!("{}: card {:.1} GiB", d.short_name(), total / GIB);
@@ -372,18 +426,120 @@ impl App {
                 yellow = true;
             }
         }
+        // YaRN (Advanced → RoPE scaling) stretches the trained length: FACTOR × ORIG (default the
+        // container's own)
+        let reach = match rope_spec(&gs(&s, "r_rope", "")) {
+            Ok(Some((f, orig))) => Some((orig.unwrap_or(cap) as f64 * f) as i64),
+            _ => None,
+        };
         if cap != 0 && ctx > cap {
+            match reach {
+                Some(r) if r >= ctx => lines.push(format!(
+                    "Context beyond the trained {} through YaRN (reaches {}); measure quality on your own work",
+                    fmt_thousands(cap),
+                    fmt_thousands(r)
+                )),
+                Some(r) => {
+                    warn.push(format!(
+                        "Context exceeds what RoPE scaling reaches ({}): raise its FACTOR or lower Context",
+                        fmt_thousands(r)
+                    ));
+                    yellow = true;
+                }
+                None => {
+                    warn.push(format!(
+                        "Context exceeds the model's training length ({}) - set Advanced → RoPE scaling to yarn:FACTOR to go past it",
+                        fmt_thousands(cap)
+                    ));
+                    yellow = true;
+                }
+            }
+        }
+        // Advanced options a plugin may not serve: Radiance refuses the start by name, so say it now
+        let arch = info.arch.to_lowercase();
+        if gs(&s, "r_cvec", "disabled") != "disabled" && !arch.starts_with("qwen4exp") {
             warn.push(format!(
-                "Context exceeds the model's training length ({}) - add --rope-scaling yarn:FACTOR in Extra args to go past it",
-                fmt_thousands(cap)
+                "Control vector: only Qwen3.8-Flash-Next (qwen4exp) applies one; Radiance refuses to start this {} container with it - set it to disabled",
+                if arch.is_empty() { "unknown" } else { arch.as_str() }
             ));
-            yellow = true;
+            red = true;
+        }
+        if gs(&s, "r_state_dtype", "(default)") == "f16" && !arch.starts_with("qwen35") {
+            warn.push("State cache f16: only the qwen35 plugins (Qwen3.8-27B and kin) serve it; Radiance refuses the start elsewhere".into());
+            red = true;
+        }
+        if gs(&s, "r_tp_attn_split", "heads") == "rows" && tp > 1.0 && !arch.starts_with("glm") {
+            warn.push("Attention split rows: only GLM-5.3's plugin declares the row split; Radiance refuses the start for this model".into());
+            red = true;
+        }
+        let kvres = gi(&s, "r_kv_resident", 0);
+        if kvres > 0 {
+            if !(arch.starts_with("qwen4exp") || arch.starts_with("glm")) {
+                lines.push("KV resident: this model may have no sparse attention group to stream; Radiance then ignores it with a warning".into());
+            }
+            if kvres < 32768 {
+                lines.push(format!("KV resident {}: Radiance raises it to 32 768 tokens", fmt_thousands(kvres)));
+            }
+            if gi(&s, "r_prefix_mib", 0) > 0 {
+                warn.push("Prefix cache is off while a KV group streams (KV resident), so its host memory goes unused".into());
+                yellow = true;
+            }
+        }
+        if gb(&s, "r_disk_tier", false) {
+            lines.push("Weights disk tier: what fits neither the cards nor the Host pool is read from the container each step, paced by the drive".into());
+        }
+        let bad: Vec<String> = RAD_TEXT_OPTS.iter().filter_map(|o| text_opt_problem(o, &gs(&s, o.key, ""))).collect();
+        if !bad.is_empty() {
+            warn.push(format!("{} - Radiance refuses the start", bad.join("; ")));
+            red = true;
         }
         if ctx == 0 {
             lines.push(format!("Context 0 = the model's own training context{}", if cap != 0 { format!(" ({})", fmt_thousands(cap)) } else { String::new() }));
         }
         if info.vision && gs(&s, "r_vision", "(default)") != "ram" {
             lines.push("vision model: Vision tower → ram moves the encoder to system RAM and gives its VRAM to the KV pool (≈55 ms per image)".into());
+        }
+        if table > 0.0 {
+            let tgib = table / GIB;
+            lines.push(format!(
+                "n-gram table {tgib:.1} GiB → {}",
+                match ngram.as_str() {
+                    "vram" => "on every card".to_string(),
+                    "ram" => "pinned in system RAM, read by the cards over PCIe".to_string(),
+                    "disk" => "read from the container as it decodes (the drive paces each step)".to_string(),
+                    _ if table_on_card => "Radiance's choice: on the cards".to_string(),
+                    _ => "Radiance's choice: pinned RAM if it seems to fit, else read from disk".to_string(),
+                }
+            ));
+            let host_pool = gi(&s, "r_host_pool", 0) as f64 * MIB * if self.r_config_mode() { 1.0 } else { tp };
+            let pinned = host_pool + gi(&s, "r_prefix_mib", 0) as f64 * MIB;
+            match ngram.as_str() {
+                "vram" if table + head > card_min => {
+                    warn.push(format!(
+                        "N-gram table vram puts all {tgib:.1} GiB of the table on every card, more than a card holds: choose ram or disk"
+                    ));
+                    red = true;
+                }
+                "ram" => {
+                    let (_, avail) = super::prefix::meminfo();
+                    let need = table + pinned + 4.0 * GIB;
+                    if avail > 0.0 && need > avail {
+                        warn.push(format!(
+                            "N-gram table ram needs the table ({tgib:.1} GiB) free beside the Host pool and Prefix cache, plus 4 GiB to spare: {:.1} GiB, and {:.1} GiB of RAM is available now. Radiance refuses the start; lower Host pool or choose disk",
+                            need / GIB,
+                            avail / GIB
+                        ));
+                        red = true;
+                    }
+                }
+                "(default)" if !table_on_card && offload => {
+                    warn.push(format!(
+                        "N-gram table (default) lets Radiance pin the {tgib:.1} GiB table in RAM, which can leave the Host pool too little pinned memory (startup then stops with out of memory). Choose disk, or ram if RAM holds both"
+                    ));
+                    yellow = true;
+                }
+                _ => {}
+            }
         }
         if gi(&s, "r_batched", 2048) > 4096 || seqs > 16 {
             lines.push("large Batch tokens / Max seqs grow the activation arena, which comes out of the KV pool".into());
@@ -411,6 +567,29 @@ impl App {
             warn.push("this container has a draft head, so Radiance refuses Prompt lookup at startup: set it to 0 and use Spec tokens".into());
             yellow = true;
         }
+        if let Some(gst) = info.gen {
+            let auto = gb(&s, "r_gen_auto", false);
+            if gst.is_image() {
+                let side = gst.max_side();
+                lines.push(format!(
+                    "image generator: the largest image is about {side}x{side} ({} latent tokens); a step needs {} rows for it with a full prompt, {} with guidance (two branches)",
+                    fmt_thousands(gst.max_tokens),
+                    fmt_thousands(gst.rows(1)),
+                    fmt_thousands(gst.rows(2))
+                ));
+            }
+            if auto {
+                lines.push(format!(
+                    "Radiance sizes it: Batch tokens{}, Max seqs and Context are left to the plugin (its startup report lists them); the activation arena grows with the step",
+                    if gst.auto_rows > 0 { format!(" ({} rows)", fmt_thousands(gst.auto_rows)) } else { String::new() }
+                ));
+            }
+            if let Some((r, t)) = gen_batch_problem(gst, gi(&s, "r_batched", 2048), auto) {
+                warn.push(t);
+                yellow = true;
+                red |= r;
+            }
+        }
         if matches!(info.kind, RadKind::Embedding | RadKind::Rerank) {
             let ectx = if ctx == 0 { cap } else { ctx };
             let batched = gi(&s, "r_batched", 2048);
@@ -435,7 +614,7 @@ impl App {
                 let ectx = if ctx == 0 { cap.max(1) } else { ctx } as f64;
                 100.0 * (ectx * seqs as f64 / tokens).min(1.0)
             }
-            None => 100.0 * ((info.bytes / tp + head) / tight_total.max(1.0)).min(1.0),
+            None => 100.0 * ((weights / tp + head) / tight_total.max(1.0)).min(1.0),
         };
         let dual_txt = if self.dual_active(p) {
             let names: Vec<String> = devs.iter().map(|d| d.short_name()).collect();
@@ -460,7 +639,8 @@ impl App {
 
     // ================================================================ fit ==
     pub fn r_fit(&mut self, p: usize) {
-        if self.panes[p].r_probe.is_some() {
+        if self.panes[p].r_probe.is_some() || self.panes[p].r_probe_next.is_some() {
+            self.panes[p].r_probe_next = None;
             self.r_probe_stop(p);
             self.set_top_status(format!("{} pane: Fit's plan check cancelled", cap_side(self.panes[p].side)));
             return;
@@ -509,6 +689,14 @@ impl App {
 
     /// Start radiance with these settings and stop it once the startup log states the KV pool.
     fn r_probe_start(&mut self, p: usize, ctx: i64, lo: Option<i64>, hi: Option<i64>, tries: u32) {
+        // the last plan check still holds its VRAM until it exits, and Radiance budgets only
+        // what is free when it starts
+        if self.r_probe_releasing(p) {
+            self.panes[p].r_probe_next = Some((ctx, lo, hi, tries));
+            self.panes[p].state = "Checking plan".into();
+            return;
+        }
+        self.panes[p].r_probe_next = None;
         let g = self.settings.g().clone();
         if !expanduser(&gs(&g, "radiance_bin", "")).is_file() {
             self.msg("error", &format!("Radiance binary not found:\n{}\n\nSet it in Settings.", gs(&g, "radiance_bin", "")));
@@ -539,7 +727,7 @@ impl App {
             }
         };
         let (tx, rx) = channel();
-        let pr = match proc::spawn(&cmd, &env, false, tx) {
+        let pr = match proc::spawn_server(&cmd, &env, false, tx) {
             Ok(pr) => pr,
             Err(e) => {
                 self.msg("error", &format!("Could not start radiance for the plan check:\n{e}"));
@@ -565,13 +753,16 @@ impl App {
             hi,
             tries,
             budget: Budget::default(),
+            ranks: self.r_devs(p).len().max(1),
+            placed: 0,
+            short: None,
         });
         let shown = format!(
             "$ {} {}",
             env_text(&env_extra),
             shlex_join(&cmd)
         );
-        let mut log = vec![format!("[LLM Duo] Fit: plan check (stopped as soon as Radiance states its KV pool){}", if ctx > 0 { format!(" at context {}", fmt_thousands(ctx)) } else { String::new() }), shown];
+        let mut log = vec![format!("[LLM Duo] Fit: plan check (stopped once Radiance states its KV pool and places the weights){}", if ctx > 0 { format!(" at context {}", fmt_thousands(ctx)) } else { String::new() }), shown];
         log.extend(super::radiance::yaml_log_lines(&yaml));
         self.append_log(p, &log);
         self.set_top_status(format!(
@@ -588,10 +779,81 @@ impl App {
                 proc::stop_group(pr.proc.pid, pr.proc.child.clone(), 3, false);
             }
         }
-        self.panes[p].r_probe = None;
+        if let Some(pr) = self.panes[p].r_probe.take() {
+            self.panes[p].r_probe_dying = Some(pr.proc.child.clone());
+        }
         if self.panes[p].proc.is_none() {
             self.panes[p].state = "Stopped".into();
         }
+    }
+
+    /// True while a stopped plan check has not exited yet (its VRAM is still held).
+    pub fn r_probe_releasing(&mut self, p: usize) -> bool {
+        let Some(c) = self.panes[p].r_probe_dying.as_ref() else { return false };
+        let alive = match c.lock() {
+            Ok(mut ch) => matches!(ch.try_wait(), Ok(None)),
+            Err(_) => false,
+        };
+        if !alive {
+            self.panes[p].r_probe_dying = None;
+        }
+        alive
+    }
+
+    /// The poll loop's share: the running plan check, or the next one once the last has exited.
+    pub fn r_probe_tick(&mut self, p: usize) {
+        if self.panes[p].r_probe.is_some() {
+            self.r_probe_poll(p);
+            return;
+        }
+        if self.panes[p].r_probe_dying.is_some() && !self.r_probe_releasing(p) {
+            match self.panes[p].r_probe_next.take() {
+                Some((ctx, lo, hi, tries)) => self.r_probe_start(p, ctx, lo, hi, tries),
+                // its VRAM is free now: the estimate's "free now" reads right again
+                None => self.update_estimate(p),
+            }
+        }
+    }
+
+    /// The experts do not fit beside even a short context's cache: say so, and what would make
+    /// room. Nothing is changed.
+    fn r_report_no_fit(&mut self, p: usize, ctx: i64, kv1: f64, deficit: f64, ranks: usize) {
+        let side = cap_side(self.panes[p].side);
+        let model = self.panes[p].model_var.clone();
+        let cards = if ranks > 1 { format!("these {ranks} cards") } else { "one card".to_string() };
+        // what the experts still lack with (almost) no cache, and with the full context's cache
+        let at_min = (deficit - kv1).max(0.0);
+        // since 2.0 the host pool is the model's total, split among its cards
+        let per = if self.r_config_mode() { ranks as f64 } else { 1.0 };
+        let mib = |b: f64| ((b * per / MIB / 1024.0).ceil() as i64 * 1024).max(1024);
+        let cur = gi(&self.r_current_options(p), "r_host_pool", 0);
+        let mut t = format!(
+            "{model} does not fit on {cards} at any context with these settings.\n\n\
+             Radiance's plan: one full-length sequence's KV cache{} takes {:.2} GiB a card, and the experts are then {:.2} GiB \
+             short of what they need on the card. With almost no context they would still be ≈ {:.2} GiB short, so Radiance \
+             refuses the start (DID NOT FIT).\n\nWhat would make room (nothing has been changed):\n",
+            if ctx > 0 { format!(" at context {}", fmt_thousands(ctx)) } else { String::new() },
+            kv1 / GIB,
+            deficit / GIB,
+            at_min / GIB,
+        );
+        if ranks == 1 {
+            t += "•  Dual GPU mode: the weights split across both cards (tensor parallel)\n";
+        }
+        t += &format!(
+            "•  Host pool (MiB){}: experts the card cannot hold stay in pinned system RAM and cross PCIe as they are \
+             needed (slower decode). ≈ {} MiB{} for this context, ≈ {} MiB with a small one\n",
+            if cur > 0 { format!(", now {cur}") } else { String::new() },
+            mib(deficit),
+            if per > 1.0 { " in total" } else { "" },
+            mib(at_min),
+        );
+        self.msg("warning", &t);
+        self.append_log(p, &[format!(
+            "[LLM Duo] Fit: the experts do not fit beside any context's cache on {cards} ({:.2} GiB short with almost none) - plan check stopped",
+            at_min / GIB
+        )]);
+        self.set_top_status(format!("{side} pane: Fit - this model does not fit on {cards} with these settings"));
     }
 
     /// Kill any plan check (on quit).
@@ -616,6 +878,12 @@ impl App {
                             pr.kv = Some(n);
                         }
                         pr.budget.line(&l);
+                        if is_rank_placed(&l) {
+                            pr.placed += 1;
+                        }
+                        if let Some(x) = expert_shortfall(&l) {
+                            pr.short = Some(x);
+                        }
                         if let Some(c) = rre().backs.captures(&l) {
                             pr.backs = c[1].parse().ok();
                             pr.sessions = c[2].parse().ok();
@@ -632,10 +900,11 @@ impl App {
         }
         let pr = self.panes[p].r_probe.as_ref().unwrap();
         let serving = pr.lines.iter().any(|l| rre().serving.is_match(l));
-        // the pool line and the sessions line come together; wait a moment for the second
-        // (a start that fails right after stating a pool did not work at that size)
+        // Radiance states the KV pool before it places the weights: the plan only counts once
+        // every card has passed placement (a "DID NOT FIT" stops the start after the pool line)
         let failed = exit.map(|rc| rc != 0).unwrap_or(false);
-        let got = !failed && pr.kv.is_some() && (pr.backs.is_some() || pr.t0.elapsed() > Duration::from_secs(4) || serving || exit.is_some());
+        let placed = pr.placed >= pr.ranks || serving || exit == Some(0);
+        let got = !failed && pr.kv.is_some() && placed;
         if got {
             let (kv, backs, sessions, fp, rel, ctx) = (pr.kv.unwrap(), pr.backs, pr.sessions, pr.fp.clone(), pr.rel.clone(), pr.ctx);
             let (seqs, hi, tries) = (pr.seqs, pr.hi, pr.tries);
@@ -662,7 +931,7 @@ impl App {
                 p,
                 &rel,
                 &fp,
-                json!({"kv_tokens": kv, "cap_tokens": cap, "backs": backs, "sessions": sessions, "ctx": ctx, "source": "probe", "when": now_iso()}),
+                json!({"kv_tokens": kv, "cap_tokens": cap, "backs": backs, "sessions": sessions, "ctx": ctx, "source": "probe", "placed": true, "when": now_iso()}),
             );
             if self.panes[p].model_var == rel {
                 self.r_apply_fit(p, cap, "probe");
@@ -671,19 +940,33 @@ impl App {
             return;
         }
         let lines = pr.lines.clone();
-        let (ctx, lo, tries) = (pr.ctx, pr.lo, pr.tries);
+        let (ctx, lo, tries, short, ranks) = (pr.ctx, pr.lo, pr.tries, pr.short, pr.ranks);
         if let Some(rc) = exit {
             self.panes[p].r_probe = None;
             self.panes[p].state = "Stopped".into();
             let hint = rad_failure_hint(&lines);
             let text = lines.join("\n");
             let didnt_fit = text.contains("DID NOT FIT") || text.to_lowercase().contains("did not fit");
+            // the experts need more of the card than one full-length sequence's cache leaves:
+            // the cache shrinks with the context, so a context that frees `deficit` fits
+            let shortfall = short.filter(|_| didnt_fit).map(|(kv1, exp, need)| (kv1, (need - exp).max(0.0)));
+            if let Some((kv1, deficit)) = shortfall {
+                if deficit >= kv1 * 0.95 || (ctx > 0 && ctx <= 4096) {
+                    self.r_report_no_fit(p, ctx, kv1, deficit, ranks);
+                    return;
+                }
+            }
             if didnt_fit && tries < 8 && (ctx == 0 || ctx > 4096) {
                 let hi = if ctx == 0 { 1 << 20 } else { ctx };
-                let next = match lo {
-                    Some(l) => (l + hi) / 2 / 1024 * 1024,
-                    None if ctx == 0 => 131072,
-                    None => (ctx / 2 / 1024 * 1024).max(4096),
+                let next = match (lo, shortfall) {
+                    (Some(l), _) => (l + hi) / 2 / 1024 * 1024,
+                    // the cache's share that frees enough for the experts, less a little for
+                    // per-sequence state that does not shrink with the context
+                    (None, Some((kv1, deficit))) if ctx > 0 => {
+                        ((ctx as f64 * (kv1 - deficit) / kv1 * 0.97) as i64 / 1024 * 1024).max(4096)
+                    }
+                    (None, _) if ctx == 0 => 131072,
+                    (None, _) => (ctx / 2 / 1024 * 1024).max(4096),
                 };
                 if lo.map(|l| next <= l).unwrap_or(false) || next >= hi {
                     // bisection done: the largest context that started
@@ -697,6 +980,19 @@ impl App {
                 return;
             }
             let tail: Vec<String> = lines.iter().rev().take(14).rev().cloned().collect();
+            if didnt_fit {
+                self.msg(
+                    "warning",
+                    &format!(
+                        "Radiance's plan did not fit{} (exit code {rc}), and Fit found no smaller context that does.\n\n{}Its log says what did not fit (the 'DID NOT FIT' block). Try: Dual GPU mode, a Host pool (MoE models), the i8 KV cache, or Vision tower → ram.\n\nLast lines:\n{}",
+                        if ctx > 0 { format!(" at context {}", fmt_thousands(ctx)) } else { String::new() },
+                        if hint.is_empty() { String::new() } else { format!("Likely cause: {hint}\n\n") },
+                        tail.join("\n")
+                    ),
+                );
+                self.set_top_status(format!("{} pane: Fit - these settings do not fit, see the log", cap_side(self.panes[p].side)));
+                return;
+            }
             self.msg(
                 "warning",
                 &format!(
@@ -724,6 +1020,15 @@ impl App {
         }
     }
 
+    /// The selected model's generator step, if it is a generator (image, video, audio, 3D): from the
+    /// model info, or from `rad-info` while that is still being read.
+    pub fn r_gen(&self, p: usize) -> Option<&'static GenStep> {
+        match self.panes[p].info_r() {
+            Some(i) => i.gen,
+            None => self.model_path(p).and_then(|m| rad_arch(&m)).and_then(|a| gen_step(&a)),
+        }
+    }
+
     // ============================================================ command ==
     /// The radiance command line. `probe_ctx`: Fit's plan check at that context.
     pub fn r_build_command(&mut self, p: usize, probe_ctx: Option<i64>) -> Result<(Vec<String>, Opts), String> {
@@ -739,6 +1044,9 @@ impl App {
             // 2.0 reserves ':' for base:adapter
             n.strip_suffix(".rad").map(String::from).unwrap_or(n).replace(':', "-")
         };
+        // a generator with "Radiance sizes it": its plugin sizes the step, the images in a pass and
+        // the conditioning (RadArchProbe::gen_rows), which it does only for flags not given
+        let gen_auto = probe_ctx.is_none() && gb(&s, "r_gen_auto", false) && self.r_gen(p).is_some();
         let mut cmd: Vec<String> = vec![
             expanduser(&gs(&g, "radiance_bin", "radiance")).to_string_lossy().into_owned(),
             "--model".into(),
@@ -749,15 +1057,19 @@ impl App {
             gs(&g, "host", "127.0.0.1"),
             "--port".into(),
             gi(&s, "port", 8080).to_string(),
-            "--max-model-len".into(),
-            probe_ctx.unwrap_or_else(|| gi(&s, "ctx", 32768)).to_string(),
-            "--kv-cache-dtype".into(),
-            gs(&s, "r_kv", "i8"),
-            "--max-num-seqs".into(),
-            gi(&s, "parallel", 1).to_string(),
-            "--max-num-batched-tokens".into(),
-            gi(&s, "r_batched", 2048).to_string(),
         ];
+        if !gen_auto {
+            cmd.extend(["--max-model-len".into(), probe_ctx.unwrap_or_else(|| gi(&s, "ctx", 32768)).to_string()]);
+        }
+        cmd.extend(["--kv-cache-dtype".into(), gs(&s, "r_kv", "i8")]);
+        if !gen_auto {
+            cmd.extend([
+                "--max-num-seqs".into(),
+                gi(&s, "parallel", 1).to_string(),
+                "--max-num-batched-tokens".into(),
+                gi(&s, "r_batched", 2048).to_string(),
+            ]);
+        }
         let mut push = |k: &str, v: String| {
             cmd.push(k.to_string());
             cmd.push(v);
@@ -771,7 +1083,7 @@ impl App {
         if gs(&s, "r_draft_window", "fixed") == "adaptive" {
             push("--draft-window", "adaptive".into());
         }
-        for (k, flag) in [("r_vision", "--vision-tower-placement"), ("r_embed", "--embedding-placement")] {
+        for (k, flag) in [("r_vision", "--vision-tower-placement"), ("r_embed", "--embedding-placement"), ("r_ngram_place", "--ngram-placement")] {
             let v = gs(&s, k, "(default)");
             if v != "(default)" {
                 push(flag, v);
@@ -793,11 +1105,40 @@ impl App {
         if re != "(default)" && !re.is_empty() {
             push("--reasoning-effort", re);
         }
+        let cv = gs(&s, "r_cvec", "disabled");
+        if cv != "disabled" {
+            push("--control-vector", cv);
+        }
+        let st = gs(&s, "r_state_dtype", "(default)");
+        if st != "(default)" {
+            push("--state-cache-dtype", st);
+        }
+        if gi(&s, "r_kv_resident", 0) > 0 {
+            push("--kv-resident", gi(&s, "r_kv_resident", 0).to_string());
+        }
+        if gs(&s, "r_weight_prefetch", "on") == "off" {
+            push("--weight-prefetch", "off".into());
+        }
+        for t in RAD_TEXT_OPTS.iter() {
+            let v = gs(&s, t.key, "");
+            if !v.trim().is_empty() {
+                push(t.flag, v.trim().to_string());
+            }
+        }
         if devs.len() > 1 {
             push("--tp", devs.len().to_string());
             if gs(&s, "r_tp_wire", "exact") != "exact" {
                 push("--tp-wire", gs(&s, "r_tp_wire", "exact"));
             }
+            if gs(&s, "r_tp_attn_split", "heads") == "rows" {
+                push("--tp-attn-split", "rows".into());
+            }
+            if gs(&s, "r_p2p", "auto") != "auto" {
+                push("--p2p", gs(&s, "r_p2p", "auto"));
+            }
+        }
+        if gb(&s, "r_disk_tier", false) {
+            cmd.push("--weights-disk-tier".into()); // a switch: rad-yaml writes it as `true`
         }
         let extra = gs(&s, "extra", "");
         if !extra.trim().is_empty() {
